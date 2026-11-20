@@ -277,21 +277,34 @@ export class Cache {
         ? splitChecksumComponents(expectedChecksum).cacheKey
         : this.cacheKey;
 
-      // Archives that already matched their checksum get an mtime derived from it, so that later
-      // installs only have to stat them; any write to the archive resets the mtime and the check
-      const verifiedMtimeMs = expectedChecksum !== null && controlPath === null && !isColdHit && !opts.skipIntegrityCheck
-        ? getVerifiedMtimeMs(expectedChecksum)
+      // Global cache archives that matched their checksum get a stamp binding that checksum to the archive's
+      // identity, so later installs only stat them; writing to an archive always moves its ctime, which voids the stamp
+      const stampPath = expectedChecksum !== null && controlPath === null && !isColdHit && !opts.skipIntegrityCheck && this.configuration.get(`enableGlobalCache`)
+        ? ppath.join(this.cwd, `.verified` as Filename, ppath.basename(path))
         : null;
 
-      const isVerified = verifiedMtimeMs !== null
-        && (await xfs.statPromise(path).catch(() => null))?.mtimeMs === verifiedMtimeMs;
+      const archiveStat = stampPath !== null
+        ? await xfs.statPromise(path, {bigint: true}).catch(() => null)
+        : null;
+
+      const stamp = archiveStat !== null
+        ? `${expectedChecksum}\n${archiveStat.dev}:${archiveStat.ino}:${archiveStat.size}:${archiveStat.mtimeNs}:${archiveStat.ctimeNs}\n`
+        : null;
+
+      const isVerified = stamp !== null
+        && await xfs.readFilePromise(stampPath!, `utf8`).then(content => content === stamp, () => false);
 
       const actualChecksum = (!opts.skipIntegrityCheck || !expectedChecksum) && !isVerified
         ? `${actualCacheKey}/${await hashUtils.checksumFile(path)}`
         : expectedChecksum!;
 
-      if (verifiedMtimeMs !== null && !isVerified && actualChecksum === expectedChecksum)
-        await xfs.utimesPromise(path, new Date(), new Date(verifiedMtimeMs)).catch(() => {});
+      if (stamp !== null && !isVerified && actualChecksum === expectedChecksum) {
+        const stampPathTemp = `${stampPath}${this.cacheId}` as PortablePath;
+        await xfs.mkdirPromise(ppath.dirname(stampPath!), {recursive: true})
+          .then(() => xfs.writeFilePromise(stampPathTemp, stamp))
+          .then(() => xfs.renamePromise(stampPathTemp, stampPath!))
+          .catch(() => xfs.removePromise(stampPathTemp).catch(() => {}));
+      }
 
       if (controlPath !== null) {
         const previousChecksum = (!opts.skipIntegrityCheck || !expectedChecksum)
@@ -514,12 +527,6 @@ export class Cache {
 
     return [aliasFs, releaseFs, exposedChecksum];
   }
-}
-
-// Even seconds in 1984-1985 never occur naturally and survive filesystems with a 2s mtime resolution
-function getVerifiedMtimeMs(checksum: string) {
-  const seed = parseInt(splitChecksumComponents(checksum).hash.slice(0, 8), 16);
-  return Number.isNaN(seed) ? null : (456789000 + 2 * (seed % 1e6)) * 1000;
 }
 
 const CHECKSUM_REGEX = /^(?:(?<cacheKey>(?<cacheVersion>[0-9]+)(?<cacheSpec>.*))\/)?(?<hash>.*)$/;
