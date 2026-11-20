@@ -1,7 +1,7 @@
 releases:
-  "@yarnpkg/cli": patch
+  "@yarnpkg/cli": minor
   "@yarnpkg/core": patch
-  "@yarnpkg/plugin-nm": patch
+  "@yarnpkg/plugin-nm": minor
 
 declined:
   - "@yarnpkg/builder"

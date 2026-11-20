@@ -1525,6 +1525,8 @@ describe(`Node_Modules`, () => {
       {
         nodeLinker: `node-modules`,
         nmMode: `hardlinks-global`,
+        // The store is only read when node_modules is linked from scratch, which a spare tree would avoid
+        nmSpareTree: false,
       },
       async ({path, run}) => {
         await run(`install`);

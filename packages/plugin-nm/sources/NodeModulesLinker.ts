@@ -16,6 +16,8 @@ import {UsageError}                                                         from
 import crypto                                                               from 'crypto';
 import fs                                                                   from 'fs';
 
+import {isSpareTreeSupported, restoreSpareTree, spareTreeInstalls}          from './spareTree';
+
 const STATE_FILE_VERSION = 1;
 const NODE_MODULES = `node_modules` as Filename;
 const DOT_BIN = `.bin` as Filename;
@@ -258,8 +260,15 @@ class NodeModulesInstaller implements Installer {
       }),
     });
 
-    let preinstallState = await findInstallState(this.opts.project);
     const nmModeSetting = this.opts.project.configuration.get(`nmMode`);
+
+    // A missing node_modules gets created from scratch, unless a spare tree from a previous install can take its place
+    const isFreshTree = await xfs.lstatPromise(ppath.join(this.opts.project.cwd, NODE_MODULES)).then(() => false, () => true);
+    const useSpareTree = nmModeSetting === NodeModulesMode.HARDLINKS_GLOBAL && isSpareTreeSupported(this.opts.project.configuration);
+    if (isFreshTree && useSpareTree)
+      await restoreSpareTree(this.opts.project);
+
+    let preinstallState = await findInstallState(this.opts.project);
 
     // Remove build state as well, to force rebuild of all the packages
     if (preinstallState === null || nmModeSetting !== preinstallState.nmMode) {
@@ -356,7 +365,7 @@ class NodeModulesInstaller implements Installer {
         : null,
     });
 
-    await persistNodeModules(preinstallState, locatorMap, packageMap, {
+    const nmMode = await persistNodeModules(preinstallState, locatorMap, packageMap, {
       baseFs: defaultFsLayer,
       project: this.opts.project,
       report: this.opts.report,
@@ -395,6 +404,19 @@ class NodeModulesInstaller implements Installer {
         buildLocations: installRecord.locations,
         locator,
         buildRequest,
+      });
+    }
+
+    if (useSpareTree) {
+      // Packages that get built are left out of the spare tree, so that restoring it relinks and rebuilds them like a fresh install would
+      const rootNodeModules = ppath.join(this.opts.project.cwd, NODE_MODULES);
+      const builtLocations = installStatuses.flatMap(({buildRequest, buildLocations}) => buildRequest.skipped ? [] : buildLocations)
+        .map(location => ppath.contains(rootNodeModules, location))
+        .filter((location): location is PortablePath => location !== null && location !== PortablePath.dot && location !== ``);
+
+      spareTreeInstalls.set(this.opts.project, {
+        isFreshTree: isFreshTree && nmMode === NodeModulesMode.HARDLINKS_GLOBAL,
+        builtLocations,
       });
     }
 
@@ -1125,7 +1147,7 @@ function invalidateBinSymlinks(binSymlinks: BinSymlinkMap, changedLocations: Set
   }
 }
 
-async function persistNodeModules(preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, {baseFs, project, report, loadManifest, realLocatorChecksums}: {project: Project, baseFs: FakeFS<PortablePath>, report: Report, loadManifest: LoadManifest, realLocatorChecksums: Map<LocatorHash, string | null>}) {
+async function persistNodeModules(preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, {baseFs, project, report, loadManifest, realLocatorChecksums}: {project: Project, baseFs: FakeFS<PortablePath>, report: Report, loadManifest: LoadManifest, realLocatorChecksums: Map<LocatorHash, string | null>}): Promise<NodeModulesMode> {
   const rootNmDirPath = ppath.join(project.cwd, NODE_MODULES);
 
   const {
@@ -1406,6 +1428,8 @@ async function persistNodeModules(preinstallState: InstallState, installState: N
     if (nmModeSetting == NodeModulesMode.HARDLINKS_GLOBAL && nmMode.value == NodeModulesMode.HARDLINKS_LOCAL) {
       report.reportWarningOnce(MessageName.NM_HARDLINKS_MODE_DOWNGRADED, `'nmMode' has been downgraded to 'hardlinks-local' due to global cache and install folder being on different devices`);
     }
+
+    return nmMode.value;
   } finally {
     reportedProgress.stop();
   }
