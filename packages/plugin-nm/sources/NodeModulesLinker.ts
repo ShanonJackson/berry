@@ -210,7 +210,17 @@ class NodeModulesInstaller implements Installer {
     });
 
     // We need ZIP contents checksum for CAS addressing purposes, so we need to strip cache key from checksum here
-    const checksum = fetchResult.checksum ? fetchResult.checksum.substring(fetchResult.checksum.indexOf(`/`) + 1) : null;
+    let checksum = fetchResult.checksum ? fetchResult.checksum.substring(fetchResult.checksum.indexOf(`/`) + 1) : null;
+
+    // Conditional packages have no checksum; keying them on their archive avoids rehashing all their files on every install
+    if (checksum === null && this.opts.project.conditionalLocators.has(pkg.locatorHash)) {
+      const archivePath = fetchResult.packageFs.getRealPath();
+      const archiveStat = await xfs.statPromise(archivePath).catch(() => null);
+      if (archiveStat?.isFile()) {
+        checksum = hashUtils.makeHash(`conditional`, archivePath, `${archiveStat.size}`, `${archiveStat.mtimeMs}`);
+      }
+    }
+
     this.realLocatorChecksums.set(realLocator.locatorHash, checksum);
 
     return {
@@ -752,7 +762,9 @@ async function copyFilePromise({srcPath, dstPath, entry, globalHardlinksStore, b
 
       let doesContentFileExist;
       try {
-        const stats = await xfs.statPromise(contentFilePath);
+        // The sync calls below are deliberate: each costs a few microseconds, which is less than
+        // a round-trip through the libuv threadpool, and this loop runs for every file of every package
+        const stats = xfs.statSync(contentFilePath);
 
         if (stats && (!entry.mtimeMs || stats.mtimeMs > entry.mtimeMs || stats.mtimeMs < entry.mtimeMs - MTIME_ACCURANCY)) {
           const contentDigest = await hashUtils.checksumFile(contentFilePath, {baseFs: xfs, algorithm: `sha1`});
@@ -774,12 +786,13 @@ async function copyFilePromise({srcPath, dstPath, entry, globalHardlinksStore, b
               await xfs.unlinkPromise(tmpPath);
             } catch {
             }
-          } else if (!entry.mtimeMs) {
+          } else {
+            // Record the mtime we just verified, otherwise a stale value makes us rehash the file on every install
             entry.mtimeMs = Math.ceil(stats.mtimeMs);
           }
         }
 
-        await xfs.linkPromise(contentFilePath, dstPath);
+        xfs.linkSync(contentFilePath, dstPath);
         doesContentFileExist = true;
       } catch {
         doesContentFileExist = false;
@@ -804,7 +817,7 @@ async function copyFilePromise({srcPath, dstPath, entry, globalHardlinksStore, b
     const mode = entry.mode & 0o777;
     // An optimization - files will have rw-r-r permissions (0o644) by default, we can skip chmod for them
     if (mode !== 0o644) {
-      await xfs.chmodPromise(dstPath, mode);
+      xfs.chmodSync(dstPath, mode);
     }
   }
 }
@@ -1169,7 +1182,7 @@ async function persistNodeModules(preinstallState: InstallState, installState: N
               }
             } else {
               if (nmMode.value === NodeModulesMode.HARDLINKS_LOCAL || nmMode.value === NodeModulesMode.HARDLINKS_GLOBAL) {
-                await xfs.linkPromise(src, dst);
+                xfs.linkSync(src, dst);
               } else {
                 await xfs.copyFilePromise(src, dst, fs.constants.COPYFILE_FICLONE);
               }
