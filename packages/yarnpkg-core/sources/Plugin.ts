@@ -122,6 +122,20 @@ export interface Hooks {
   ) => Promise<Descriptor>;
 
   /**
+   * Called at the start of an install when none of its inputs (lockfile,
+   * manifests, configuration, Yarn and Node versions) changed since the last
+   * install that fully succeeded. Starts with `false`; the plugin of the
+   * active linker can set it to `true` if the artifacts it wrote are still
+   * intact, in which case the install has nothing left to do and stops there.
+   * Any plugin can set it back to `false`.
+   */
+  isInstallUpToDate?: (
+    upToDate: boolean,
+    project: Project,
+    options: InstallOptions,
+  ) => Promise<boolean>;
+
+  /**
    * Called after the `install` method from the `Project` class successfully
    * completed.
    */
