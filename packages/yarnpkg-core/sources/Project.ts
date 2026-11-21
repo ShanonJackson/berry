@@ -1790,10 +1790,10 @@ export class Project {
     if (await this.isUpToDate(opts)) {
       opts.report.reportInfo(MessageName.UNNAMED, `Already up to date`);
 
-      await this.configuration.triggerHook(hooks => {
-        return hooks.afterAllInstalled;
-      }, this, opts);
+      // The validation hooks look at the dependency tree, which the lockfile (unchanged since) resolves to
+      await this.restoreInstallState({restoreLinkersCustomData: false, restoreBuildState: false, restoreResolutions: true});
 
+      await this.completeInstall(opts);
       return;
     }
 
@@ -1927,7 +1927,14 @@ export class Project {
     });
 
     await this.persistInstallStateFile();
+    await this.completeInstall(opts);
+  }
 
+  /**
+   * The last steps of an install, which also run when there was nothing else
+   * to do: they validate the project as it is now, not what the install did.
+   */
+  private async completeInstall(opts: InstallOptions) {
     let hasPostErrors = false;
     await opts.report.startTimerPromise(`Post-install validation`, {
       skipIfEmpty: true,
@@ -1959,7 +1966,7 @@ export class Project {
    * the linker confirms that what it wrote is intact. Only regular installs
    * qualify (no special mode, nor any option that asks for extra checks).
    */
-  async isUpToDate(opts: InstallOptions) {
+  private async isUpToDate(opts: InstallOptions) {
     if (this.storedUpToDateKey === null)
       return false;
 

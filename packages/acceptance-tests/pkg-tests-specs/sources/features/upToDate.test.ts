@@ -190,6 +190,22 @@ describe(`Features`, () => {
       }),
     );
 
+    test(`it should still run the post-install validation when nothing changed`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, {
+        ...CONFIG,
+        enableConstraintsChecks: true,
+      }, async ({path, run}) => {
+        await run(`install`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+
+        // Constraints aren't install inputs, but they're checked after every install
+        await xfs.writeFilePromise(ppath.join(path, `yarn.config.cjs` as PortablePath), `exports.constraints = ({Yarn}) => {\n  for (const workspace of Yarn.workspaces())\n    workspace.set('foo', 'bar');\n};\n`);
+        await expect(run(`install`)).rejects.toThrow(/Constraint check failed/);
+      }),
+    );
+
     test(`it should not skip installs that ask for extra checks`,
       makeTemporaryEnv({
         dependencies: {[`no-deps`]: `1.0.0`},

@@ -7,7 +7,7 @@ import {getGlobalHardlinksStore}            from './NodeModulesLinker';
 import {isNodeModulesUpToDate}              from './NodeModulesLinker';
 import {PnpLooseLinker}                     from './PnpLooseLinker';
 import {getSpareTreeStore}                  from './spareTree';
-import {refreshSpareTree}                   from './spareTree';
+import {refreshSpareTrees}                  from './spareTree';
 import {spareTreeInstalls}                  from './spareTree';
 
 export {NodeModulesLinker};
@@ -42,7 +42,7 @@ const plugin: Plugin<Hooks> = {
         return;
 
       spareTreeInstalls.delete(project);
-      await refreshSpareTree(project, spareTreeInstall);
+      await refreshSpareTrees(project, spareTreeInstall);
     },
   },
   configuration: {
@@ -72,7 +72,7 @@ const plugin: Plugin<Hooks> = {
       default: true,
     },
     nmSpareTree: {
-      description: `If true, when using \`nmMode: hardlinks-global\` Yarn keeps a spare copy of the freshly installed \`node_modules\` folders (made of hardlinks) in the global folder, and moves it into place the next time they are all missing instead of linking every file again. The copy is made in the background after the install, and is only used if none of its files changed since. Not available on Windows.`,
+      description: `If true, Yarn keeps a spare copy of each freshly installed \`node_modules\` folder in the global folder, and moves it into place the next time the folder is missing instead of writing every file again. The copy is made of hardlinks in the background after the install, so it shares the files of the folder (which means that removing the folder doesn't free their space until the next install), and is only used if none of its files changed since. Off by default on CI, and not available on Windows.`,
       type: SettingsType.BOOLEAN,
       default: true,
     },
