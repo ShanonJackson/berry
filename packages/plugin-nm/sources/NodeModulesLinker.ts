@@ -18,6 +18,9 @@ import fs                                                                   from
 
 import {DirCloner, cloneDirInto, ensureDirCloneSlot}                        from './dirClone';
 import {getDirCloneSlot, startDirCloner}                                    from './dirClone';
+import {areAllNodeModulesMissing, hasRestoredSpareTree}                     from './spareTree';
+import {isSpareTreeSupported, refreshSpareTree, restoreSpareTree}           from './spareTree';
+import {spareTreeInstalls}                                                  from './spareTree';
 
 const STATE_FILE_VERSION = 1;
 const NODE_MODULES = `node_modules` as Filename;
@@ -261,8 +264,15 @@ class NodeModulesInstaller implements Installer {
       }),
     });
 
-    let preinstallState = await findInstallState(this.opts.project);
     const nmModeSetting = this.opts.project.configuration.get(`nmMode`);
+
+    // Missing node_modules folders get created from scratch, unless a spare tree from a previous install can take their place
+    const useSpareTree = nmModeSetting === NodeModulesMode.HARDLINKS_GLOBAL && isSpareTreeSupported(this.opts.project.configuration);
+    const isFreshTree = hasRestoredSpareTree(this.opts.project) || await areAllNodeModulesMissing(this.opts.project);
+    if (useSpareTree && !hasRestoredSpareTree(this.opts.project) && isFreshTree)
+      await restoreSpareTree(this.opts.project);
+
+    let preinstallState = await findInstallState(this.opts.project);
 
     // Remove build state as well, to force rebuild of all the packages
     if (preinstallState === null || nmModeSetting !== preinstallState.nmMode) {
@@ -359,7 +369,7 @@ class NodeModulesInstaller implements Installer {
         : null,
     });
 
-    await persistNodeModules(preinstallState, locatorMap, packageMap, {
+    const nmMode = await persistNodeModules(preinstallState, locatorMap, packageMap, {
       baseFs: defaultFsLayer,
       project: this.opts.project,
       report: this.opts.report,
@@ -398,6 +408,18 @@ class NodeModulesInstaller implements Installer {
         buildLocations: installRecord.locations,
         locator,
         buildRequest,
+      });
+    }
+
+    if (useSpareTree) {
+      // Packages that get built are left out of the spare tree, so that restoring it relinks and rebuilds them like a fresh install would
+      const builtLocations = installStatuses.flatMap(({buildRequest, buildLocations}) => buildRequest.skipped ? [] : buildLocations)
+        .map(location => ppath.contains(this.opts.project.cwd, location))
+        .filter((location): location is PortablePath => location !== null && location !== PortablePath.dot && location !== ``);
+
+      spareTreeInstalls.set(this.opts.project, {
+        isFreshTree: isFreshTree && nmMode === NodeModulesMode.HARDLINKS_GLOBAL,
+        builtLocations,
       });
     }
 
@@ -1100,6 +1122,61 @@ const areRealLocatorsEqual = (locatorKey1?: LocatorKey, locatorKey2?: LocatorKey
   return structUtils.areLocatorsEqual(locator1, locator2);
 };
 
+/**
+ * Tells whether the node_modules folders still match what the last install
+ * wrote, without changing them (except for restoring a spare tree, which then
+ * has to match as well). The core only asks once it knows that none of the
+ * install inputs changed since that install.
+ */
+export async function isNodeModulesUpToDate(project: Project): Promise<boolean> {
+  const nmModeSetting = project.configuration.get(`nmMode`);
+
+  if (await areAllNodeModulesMissing(project)) {
+    const useSpareTree = nmModeSetting === NodeModulesMode.HARDLINKS_GLOBAL && isSpareTreeSupported(project.configuration);
+    if (!useSpareTree || !await restoreSpareTree(project)) {
+      return false;
+    }
+  }
+
+  const preinstallState = await findInstallState(project);
+  if (preinstallState === null || preinstallState.nmMode !== nmModeSetting)
+    return false;
+
+  // Same check as the one an install does to find out what the user changed on disk (removed packages, folders, binaries)
+  const {installChangedByUser} = syncPreinstallStateWithDisk(preinstallState.locationTree, preinstallState.binSymlinks, preinstallState.mtimeMs, project);
+  if (installChangedByUser)
+    return false;
+
+  // Binaries are only linked when their targets exist, so an install would remove the links of the targets that
+  // disappeared, and add those of the workspace binaries that appeared since (e.g. built after the last install)
+  const linkedTargets = new Set<PortablePath>();
+  for (const symlinks of preinstallState.binSymlinks.values()) {
+    for (const target of symlinks.values()) {
+      const normalizedTarget = ppath.resolve(target);
+      if (!xfs.existsSync(normalizedTarget))
+        return false;
+
+      linkedTargets.add(normalizedTarget);
+    }
+  }
+
+  for (const workspace of project.workspaces) {
+    for (const value of workspace.manifest.bin.values()) {
+      const target = ppath.resolve(workspace.cwd, value);
+      if (value !== `` && xfs.existsSync(target) && !linkedTargets.has(target)) {
+        return false;
+      }
+    }
+  }
+
+  // A restored spare tree is now node_modules, so another one has to be made for next time; nothing it contained gets
+  // built (packages that do aren't part of it, and would have been reported missing above)
+  if (hasRestoredSpareTree(project))
+    await refreshSpareTree(project, {isFreshTree: true, builtLocations: []});
+
+  return true;
+}
+
 export function getGlobalHardlinksStore(configuration: Configuration): PortablePath {
   return ppath.join(configuration.get(`globalFolder`), `store` as Filename);
 }
@@ -1130,7 +1207,7 @@ function invalidateBinSymlinks(binSymlinks: BinSymlinkMap, changedLocations: Set
   }
 }
 
-async function persistNodeModules(preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, {baseFs, project, report, loadManifest, realLocatorChecksums}: {project: Project, baseFs: FakeFS<PortablePath>, report: Report, loadManifest: LoadManifest, realLocatorChecksums: Map<LocatorHash, string | null>}) {
+async function persistNodeModules(preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, {baseFs, project, report, loadManifest, realLocatorChecksums}: {project: Project, baseFs: FakeFS<PortablePath>, report: Report, loadManifest: LoadManifest, realLocatorChecksums: Map<LocatorHash, string | null>}): Promise<NodeModulesMode> {
   const rootNmDirPath = ppath.join(project.cwd, NODE_MODULES);
 
   const {
@@ -1448,6 +1525,8 @@ async function persistNodeModules(preinstallState: InstallState, installState: N
     if (nmModeSetting == NodeModulesMode.HARDLINKS_GLOBAL && nmMode.value == NodeModulesMode.HARDLINKS_LOCAL) {
       report.reportWarningOnce(MessageName.NM_HARDLINKS_MODE_DOWNGRADED, `'nmMode' has been downgraded to 'hardlinks-local' due to global cache and install folder being on different devices`);
     }
+
+    return nmMode.value;
   } finally {
     reportedProgress.stop();
     dirCloner?.close();
