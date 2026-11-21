@@ -28,6 +28,7 @@ import {StreamReport, SUPPORTS_GROUPS}                                          
 import {ThrowReport}                                                                                                   from './ThrowReport';
 import {WorkspaceResolver}                                                                                             from './WorkspaceResolver';
 import {Workspace}                                                                                                     from './Workspace';
+import {YarnVersion}                                                                                                   from './YarnVersion';
 import {isFolderInside}                                                                                                from './folderUtils';
 import * as formatUtils                                                                                                from './formatUtils';
 import * as hashUtils                                                                                                  from './hashUtils';
@@ -153,6 +154,7 @@ const INSTALL_STATE_FIELDS = {
   restoreBuildState: [
     `skippedBuilds`,
     `storedBuildState`,
+    `storedUpToDateKey`,
   ] as const,
 };
 
@@ -257,6 +259,16 @@ export class Project {
   public originalPackages: Map<LocatorHash, Package> = new Map();
   public optionalBuilds: Set<LocatorHash> = new Set();
   public skippedBuilds: Set<LocatorHash> = new Set();
+
+  /**
+   * Set by the last install if it fully succeeded: a hash of everything the
+   * install depends on, and the cache archives it used. The next install can
+   * skip all of its steps if none of that changed (see `isUpToDate`).
+   */
+  public storedUpToDateKey: {key: string, archives: Array<PortablePath>} | null = null;
+
+  // Whether all the builds that had to run during the last link succeeded
+  private areBuildsComplete: boolean = false;
 
   /**
    * If true, the data contained within `originalPackages` are from a different
@@ -1729,6 +1741,7 @@ export class Project {
     // package (and avoid rebuilding it later if it didn't change).
 
     this.storedBuildState = nextBState;
+    this.areBuildsComplete = Array.from(packageBuildDirectives.keys()).every(locatorHash => nextBState.has(locatorHash));
     this.skippedBuilds = nextSkippedBuilds;
   }
 
@@ -1773,6 +1786,19 @@ export class Project {
 
     if (hasPreErrors)
       return;
+
+    if (await this.isUpToDate(opts)) {
+      opts.report.reportInfo(MessageName.UNNAMED, `Already up to date`);
+
+      await this.configuration.triggerHook(hooks => {
+        return hooks.afterAllInstalled;
+      }, this, opts);
+
+      return;
+    }
+
+    // Until this install fully succeeds, the next one can't skip anything
+    this.storedUpToDateKey = null;
 
     const packageExtensions = await this.configuration.getPackageExtensions();
 
@@ -1895,6 +1921,9 @@ export class Project {
           opts.report.reportError(MessageName.FROZEN_ARTIFACT_EXCEPTION, `The checksum for ${immutablePatterns[t]} has been modified by this install, which is explicitly forbidden.`);
         }
       }
+
+      // Stored along with the rest of the install state, right below
+      this.storedUpToDateKey = await this.getUpToDateKey(opts);
     });
 
     await this.persistInstallStateFile();
@@ -1922,6 +1951,95 @@ export class Project {
     await this.configuration.triggerHook(hooks => {
       return hooks.afterAllInstalled;
     }, this, opts);
+  }
+
+  /**
+   * An install has nothing to do if the last one fully succeeded, none of its
+   * inputs changed since, the cache archives it used are all still there, and
+   * the linker confirms that what it wrote is intact. Only regular installs
+   * qualify (no special mode, nor any option that asks for extra checks).
+   */
+  async isUpToDate(opts: InstallOptions) {
+    if (this.storedUpToDateKey === null)
+      return false;
+
+    if (typeof opts.mode !== `undefined` || opts.lockfileOnly || opts.checkResolutions || opts.cache.check || opts.fetcher || opts.resolver || opts.persistProject === false || this.lockfileNeedsRefresh)
+      return false;
+
+    if (!this.configuration.get(`enableGlobalCache`))
+      return false;
+
+    if (await this.computeUpToDateHash() !== this.storedUpToDateKey.key)
+      return false;
+
+    for (const archive of this.storedUpToDateKey.archives)
+      if (!xfs.existsSync(archive))
+        return false;
+
+    return await this.configuration.reduceHook(hooks => {
+      return hooks.isInstallUpToDate;
+    }, false, this, opts);
+  }
+
+  private async getUpToDateKey(opts: InstallOptions) {
+    if (typeof opts.mode !== `undefined` || opts.lockfileOnly || !this.areBuildsComplete)
+      return null;
+
+    // An install that reported errors exits with an error, so the next one must try again
+    const report = opts.report as Report & {hasErrors?: () => boolean};
+    if (typeof report.hasErrors !== `function` || report.hasErrors())
+      return null;
+
+    if (!this.configuration.get(`enableGlobalCache`))
+      return null;
+
+    // Packages from other protocols (file:, portal:, user patches, ...) can change without anything else changing
+    for (const pkg of this.storedPackages.values()) {
+      const {reference} = structUtils.isVirtualLocator(pkg) ? structUtils.devirtualizeLocator(pkg) : pkg;
+      if (!reference.startsWith(`npm:`) && !reference.startsWith(`workspace:`) && !isBuiltinPatchReference(reference)) {
+        return null;
+      }
+    }
+
+    const key = await this.computeUpToDateHash();
+    if (key === null)
+      return null;
+
+    return {key, archives: [...opts.cache.markedFiles].sort()};
+  }
+
+  private async computeUpToDateHash() {
+    const hash = createHash(`sha512`);
+    const update = (...parts: Array<string | Buffer>) => {
+      for (const part of parts) {
+        hash.update(part);
+        hash.update(`\0`);
+      }
+    };
+
+    // Yarn itself (including the bundle it runs from), Node, and the system
+    const binaryPath = process.argv[1] ? npath.toPortablePath(process.argv[1]) : null;
+    const binaryStat = binaryPath !== null ? await xfs.statPromise(binaryPath).catch(() => null) : null;
+    update(YarnVersion ?? ``, `${binaryPath}`, `${binaryStat?.size}:${binaryStat?.mtimeMs}`, process.version, JSON.stringify(nodeUtils.getArchitecture()));
+    update(JSON.stringify([...this.configuration.plugins.keys()]));
+
+    // Every setting, wherever it comes from (rc files, environment)
+    update(JSON.stringify([...this.configuration.values], (key, value) => {
+      if (value instanceof Map || value instanceof Set)
+        return [...value];
+      return value;
+    }));
+
+    try {
+      update(await xfs.readFilePromise(ppath.join(this.cwd, Filename.lockfile)));
+      for (const workspace of this.workspaces) {
+        update(workspace.cwd, await xfs.readFilePromise(ppath.join(workspace.cwd, Filename.manifest)));
+      }
+    } catch {
+      return null;
+    }
+
+    return hash.digest(`hex`);
   }
 
   generateLockfile() {
@@ -2145,6 +2263,11 @@ export class Project {
       size: sizes.reduce((sum, size) => sum + size, 0),
     };
   }
+}
+
+// Yarn's builtin patches (`optional!builtin<compat/...>`) only change with Yarn itself, which is part of the key
+function isBuiltinPatchReference(reference: string) {
+  return /^patch:[^#]*@npm%3A[^#]*#optional!builtin<[^>]+>::/.test(reference);
 }
 
 /**

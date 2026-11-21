@@ -4,7 +4,11 @@ import {NodeModulesHoistingLimits}          from '@yarnpkg/nm';
 
 import {NodeModulesLinker, NodeModulesMode} from './NodeModulesLinker';
 import {getGlobalHardlinksStore}            from './NodeModulesLinker';
+import {isNodeModulesUpToDate}              from './NodeModulesLinker';
 import {PnpLooseLinker}                     from './PnpLooseLinker';
+import {getSpareTreeStore}                  from './spareTree';
+import {refreshSpareTree}                   from './spareTree';
+import {spareTreeInstalls}                  from './spareTree';
 
 export {NodeModulesLinker};
 export {NodeModulesMode};
@@ -15,6 +19,7 @@ declare module '@yarnpkg/core' {
     nmHoistingLimits: NodeModulesHoistingLimits;
     nmMode: NodeModulesMode;
     nmSelfReferences: boolean;
+    nmSpareTree: boolean;
   }
 }
 
@@ -23,6 +28,21 @@ const plugin: Plugin<Hooks> = {
     cleanGlobalArtifacts: async configuration => {
       const globalHardlinksDirectory = getGlobalHardlinksStore(configuration);
       await xfs.removePromise(globalHardlinksDirectory);
+      await xfs.removePromise(getSpareTreeStore(configuration));
+    },
+    isInstallUpToDate: async (upToDate, project) => {
+      if (project.configuration.get(`nodeLinker`) !== `node-modules`)
+        return upToDate;
+
+      return await isNodeModulesUpToDate(project);
+    },
+    afterAllInstalled: async project => {
+      const spareTreeInstall = spareTreeInstalls.get(project);
+      if (typeof spareTreeInstall === `undefined`)
+        return;
+
+      spareTreeInstalls.delete(project);
+      await refreshSpareTree(project, spareTreeInstall);
     },
   },
   configuration: {
@@ -48,6 +68,11 @@ const plugin: Plugin<Hooks> = {
     },
     nmSelfReferences: {
       description: `Defines whether the linker should generate self-referencing symlinks for workspaces.`,
+      type: SettingsType.BOOLEAN,
+      default: true,
+    },
+    nmSpareTree: {
+      description: `If true, when using \`nmMode: hardlinks-global\` Yarn keeps a spare copy of the freshly installed \`node_modules\` folders (made of hardlinks) in the global folder, and moves it into place the next time they are all missing instead of linking every file again. The copy is made in the background after the install, and is only used if none of its files changed since. Not available on Windows.`,
       type: SettingsType.BOOLEAN,
       default: true,
     },
