@@ -15,10 +15,11 @@ const PENDING_REGEXP = /\.(tmp|trash|claim|fence)$/;
 const getSpareTreeStore = (path: PortablePath) => ppath.join(path, `.yarn/global/nm-spare` as PortablePath);
 
 /**
- * The spare tree is made by a detached process once the install is done, so
- * we wait until it either produced a spare tree or gave up.
+ * Spare trees are made by a detached process once the install is done, so we
+ * wait until it either produced them or gave up. Returns the spare trees by
+ * node_modules folder (relative to the project).
  */
-async function waitForSpareTree(path: PortablePath) {
+async function waitForSpareTrees(path: PortablePath) {
   const store = getSpareTreeStore(path);
 
   let sawPending = false;
@@ -30,13 +31,24 @@ async function waitForSpareTree(path: PortablePath) {
     sawPending ||= isPending;
 
     const containers = entries.filter(entry => CONTAINER_REGEXP.test(entry) && xfs.existsSync(ppath.join(store, entry, `manifest` as Filename)));
-    if (!isPending && (containers.length > 0 || (sawPending || Date.now() - start > 3000)))
-      return containers.length > 0 ? ppath.join(store, containers[0], `tree` as Filename, Filename.nodeModules) : null;
+    if (!isPending && (containers.length > 0 || sawPending || Date.now() - start > 3000)) {
+      const spareTrees = new Map<string, PortablePath>();
+      for (const container of containers) {
+        const manifest = await xfs.readFilePromise(ppath.join(store, container, `manifest` as Filename), `utf8`);
+        spareTrees.set(JSON.parse(manifest.split(`\n`)[0]).folder, ppath.join(store, container, Filename.nodeModules));
+      }
+      return spareTrees;
+    }
 
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 
-  throw new Error(`Timed out waiting for the spare tree`);
+  throw new Error(`Timed out waiting for the spare trees`);
+}
+
+// The spare tree of the root node_modules folder
+async function waitForSpareTree(path: PortablePath) {
+  return (await waitForSpareTrees(path)).get(`node_modules`) ?? null;
 }
 
 async function getInode(p: PortablePath) {
@@ -87,9 +99,10 @@ describe(`Features`, () => {
 
         await run(`install`);
 
-        const spareTree = await waitForSpareTree(path);
-        expect(spareTree).not.toBeNull();
-        const workspaceSpareTreeInode = await getInode(ppath.join(ppath.dirname(spareTree!), `packages/a/node_modules` as PortablePath));
+        const spareTrees = await waitForSpareTrees(path);
+        expect(spareTrees.has(`node_modules`)).toEqual(true);
+        expect(spareTrees.has(`packages/a/node_modules`)).toEqual(true);
+        const workspaceSpareTreeInode = await getInode(spareTrees.get(`packages/a/node_modules`)!);
 
         await xfs.removePromise(ppath.join(path, Filename.nodeModules));
         await xfs.removePromise(ppath.join(path, `packages/a/node_modules` as PortablePath));
@@ -335,21 +348,79 @@ describe(`Features`, () => {
       }),
     );
 
-    test(`it should only be used with nmMode: hardlinks-global`,
+    for (const nmMode of [`classic`, `hardlinks-local`]) {
+      testIf(() => process.platform !== `win32`, `it should restore node_modules from the spare tree (nmMode: ${nmMode})`,
+        makeTemporaryEnv({
+          dependencies: {[`one-fixed-dep`]: `1.0.0`},
+        }, {
+          nodeLinker: `node-modules`,
+          nmMode,
+        }, async ({path, run, source}) => {
+          await run(`install`);
+
+          const spareTree = await waitForSpareTree(path);
+          expect(spareTree).not.toBeNull();
+          const spareTreeInode = await getInode(spareTree!);
+
+          await xfs.removePromise(ppath.join(path, Filename.nodeModules));
+          await run(`install`);
+
+          expect(await getInode(ppath.join(path, Filename.nodeModules))).toEqual(spareTreeInode);
+          await expect(source(`require('one-fixed-dep')`)).resolves.toMatchObject({
+            dependencies: {[`no-deps`]: {name: `no-deps`, version: `1.0.0`}},
+          });
+        }),
+      );
+    }
+
+    testIf(() => process.platform !== `win32`, `it should restore a single missing node_modules folder`,
       makeTemporaryEnv({
-        dependencies: {
-          [`no-deps`]: `1.0.0`,
-        },
-      }, {
-        nodeLinker: `node-modules`,
-        nmMode: `classic`,
-      }, async ({path, run}) => {
+        private: true,
+        workspaces: [`packages/*`],
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, SPARE_TREE_CONFIG, async ({path, run, source}) => {
+        await xfs.mkdirPromise(ppath.join(path, `packages/a` as PortablePath), {recursive: true});
+        await xfs.writeJsonPromise(ppath.join(path, `packages/a/package.json` as PortablePath), {name: `a`, dependencies: {[`no-deps`]: `2.0.0`}});
+
         await run(`install`);
+
+        const spareTree = await waitForSpareTree(path);
+        expect(spareTree).not.toBeNull();
+        const workspaceFolderInode = await getInode(ppath.join(path, `packages/a/node_modules` as PortablePath));
+
+        // Only the root folder is removed, which is the common case
         await xfs.removePromise(ppath.join(path, Filename.nodeModules));
         await run(`install`);
 
+        expect(await getInode(ppath.join(path, `packages/a/node_modules` as PortablePath))).toEqual(workspaceFolderInode);
+        await expect(source(`require('no-deps')`)).resolves.toMatchObject({version: `1.0.0`});
+        await expect(source(`require('no-deps')`, {cwd: ppath.join(path, `packages/a` as PortablePath)})).resolves.toMatchObject({version: `2.0.0`});
+
+        // A new spare tree is made for the restored folder, so this works again
+        await waitForSpareTree(path);
+        await xfs.removePromise(ppath.join(path, Filename.nodeModules));
+        await run(`install`);
+        await expect(source(`require('no-deps')`)).resolves.toMatchObject({version: `1.0.0`});
+      }),
+    );
+
+    test(`it should be off on CI unless enabled explicitly`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, SPARE_TREE_CONFIG, async ({path, run}) => {
+        await run(`install`, {env: {CI: `true`, YARN_ENABLE_IMMUTABLE_INSTALLS: `false`}});
+        await xfs.removePromise(ppath.join(path, Filename.nodeModules));
+        await run(`install`, {env: {CI: `true`, YARN_ENABLE_IMMUTABLE_INSTALLS: `false`}});
+
         expect(await waitForSpareTree(path)).toBeNull();
         expect(xfs.existsSync(getSpareTreeStore(path))).toEqual(false);
+
+        await run(`install`, {env: {CI: `true`, YARN_ENABLE_IMMUTABLE_INSTALLS: `false`, YARN_NM_SPARE_TREE: `true`}});
+        expect(await waitForSpareTree(path)).toBeNull();
+
+        await xfs.removePromise(ppath.join(path, Filename.nodeModules));
+        await run(`install`, {env: {CI: `true`, YARN_ENABLE_IMMUTABLE_INSTALLS: `false`, YARN_NM_SPARE_TREE: `true`}});
+        expect(await waitForSpareTree(path)).not.toBeNull();
       }),
     );
 
