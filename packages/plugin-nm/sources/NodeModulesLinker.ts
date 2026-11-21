@@ -16,6 +16,10 @@ import {UsageError}                                                         from
 import crypto                                                               from 'crypto';
 import fs                                                                   from 'fs';
 
+import {getMissingNodeModulesFolders, getRestoredFolders}                   from './spareTree';
+import {isSpareTreeEnabled, refreshSpareTrees, restoreSpareTrees}           from './spareTree';
+import {spareTreeInstalls}                                                  from './spareTree';
+
 const STATE_FILE_VERSION = 1;
 const NODE_MODULES = `node_modules` as Filename;
 const DOT_BIN = `.bin` as Filename;
@@ -248,8 +252,17 @@ class NodeModulesInstaller implements Installer {
       }),
     });
 
-    let preinstallState = await findInstallState(this.opts.project);
     const nmModeSetting = this.opts.project.configuration.get(`nmMode`);
+
+    // Missing node_modules folders get created from scratch, unless spare trees from a previous install can take their place
+    const useSpareTree = isSpareTreeEnabled(this.opts.project.configuration);
+    const missingFolders = await getMissingNodeModulesFolders(this.opts.project);
+    if (useSpareTree && missingFolders.length > 0)
+      await restoreSpareTrees(this.opts.project, missingFolders);
+
+    const freshFolders = [...new Set([...getRestoredFolders(this.opts.project), ...missingFolders])];
+
+    let preinstallState = await findInstallState(this.opts.project);
 
     // Remove build state as well, to force rebuild of all the packages
     if (preinstallState === null || nmModeSetting !== preinstallState.nmMode) {
@@ -386,6 +399,15 @@ class NodeModulesInstaller implements Installer {
         locator,
         buildRequest,
       });
+    }
+
+    if (useSpareTree) {
+      // Packages that get built are left out of the spare tree, so that restoring it relinks and rebuilds them like a fresh install would
+      const builtLocations = installStatuses.flatMap(({buildRequest, buildLocations}) => buildRequest.skipped ? [] : buildLocations)
+        .map(location => ppath.contains(this.opts.project.cwd, location))
+        .filter((location): location is PortablePath => location !== null && location !== PortablePath.dot && location !== ``);
+
+      spareTreeInstalls.set(this.opts.project, {freshFolders, builtLocations});
     }
 
     if (preserveSymlinksRequired)
@@ -1085,6 +1107,62 @@ const areRealLocatorsEqual = (locatorKey1?: LocatorKey, locatorKey2?: LocatorKey
 
   return structUtils.areLocatorsEqual(locator1, locator2);
 };
+
+/**
+ * Tells whether the node_modules folders still match what the last install
+ * wrote, without changing them (except for restoring a spare tree, which then
+ * has to match as well). The core only asks once it knows that none of the
+ * install inputs changed since that install.
+ */
+export async function isNodeModulesUpToDate(project: Project): Promise<boolean> {
+  const nmModeSetting = project.configuration.get(`nmMode`);
+
+  if (isSpareTreeEnabled(project.configuration)) {
+    const missingFolders = await getMissingNodeModulesFolders(project);
+    if (missingFolders.length > 0) {
+      await restoreSpareTrees(project, missingFolders);
+    }
+  }
+
+  const preinstallState = await findInstallState(project);
+  if (preinstallState === null || preinstallState.nmMode !== nmModeSetting)
+    return false;
+
+  // Same check as the one an install does to find out what the user changed on disk (removed packages, folders, binaries)
+  const {installChangedByUser} = syncPreinstallStateWithDisk(preinstallState.locationTree, preinstallState.binSymlinks, preinstallState.mtimeMs, project);
+  if (installChangedByUser)
+    return false;
+
+  // Binaries are only linked when their targets exist, so an install would remove the links of the targets that
+  // disappeared, and add those of the workspace binaries that appeared since (e.g. built after the last install)
+  const linkedTargets = new Set<PortablePath>();
+  for (const symlinks of preinstallState.binSymlinks.values()) {
+    for (const target of symlinks.values()) {
+      const normalizedTarget = ppath.resolve(target);
+      if (!xfs.existsSync(normalizedTarget))
+        return false;
+
+      linkedTargets.add(normalizedTarget);
+    }
+  }
+
+  for (const workspace of project.workspaces) {
+    for (const value of workspace.manifest.bin.values()) {
+      const target = ppath.resolve(workspace.cwd, value);
+      if (value !== `` && xfs.existsSync(target) && !linkedTargets.has(target)) {
+        return false;
+      }
+    }
+  }
+
+  // Restored spare trees are now node_modules folders, so others have to be made for next time; nothing they contained
+  // gets built (packages that do aren't part of them, and would have been reported missing above)
+  const restoredFolders = getRestoredFolders(project);
+  if (restoredFolders.size > 0)
+    await refreshSpareTrees(project, {freshFolders: [...restoredFolders], builtLocations: []});
+
+  return true;
+}
 
 export function getGlobalHardlinksStore(configuration: Configuration): PortablePath {
   return ppath.join(configuration.get(`globalFolder`), `store` as Filename);
