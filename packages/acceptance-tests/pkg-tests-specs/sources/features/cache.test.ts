@@ -82,6 +82,33 @@ describe(`Cache`, () => {
 
 
   test(
+    `it should detect when the files checksum is incorrect, even when the archive kept the same size and mtime`,
+    makeTemporaryEnv({
+      dependencies: {
+        [`no-deps`]: `1.0.0`,
+      },
+    }, async ({path, run, source}) => {
+      await run(`install`);
+
+      const cacheFiles = await xfs.readdirPromise(ppath.join(path, `.yarn/cache`));
+      const cacheFile = ppath.join(path, `.yarn/cache`, cacheFiles.find(name => name.startsWith(`no-deps-`))!);
+
+      // Use a timestamp that can be restored exactly
+      const time = new Date(`2000-01-01T00:00:00Z`);
+      await xfs.utimesPromise(cacheFile, time, time);
+
+      // The checksums of the cache archives are memoized in the install state
+      await run(`install`);
+
+      const content = await xfs.readFilePromise(cacheFile);
+      await xfs.writeFilePromise(cacheFile, Buffer.alloc(content.length, 0));
+      await xfs.utimesPromise(cacheFile, time, time);
+
+      await expect(run(`install`)).rejects.toThrow();
+    }),
+  );
+
+  test(
     `it should refetch archive when YARN_CHECKSUM_BEHAVIOR=reset and the files checksum is incorrect`,
     makeTemporaryEnv({
       dependencies: {

@@ -11,7 +11,7 @@ import {promisify}                                                              
 import v8                                                                                                              from 'v8';
 import zlib                                                                                                            from 'zlib';
 
-import {Cache, CacheOptions}                                                                                           from './Cache';
+import {Cache, CacheOptions, CacheChecksumStore}                                                                       from './Cache';
 import {Configuration}                                                                                                 from './Configuration';
 import {Fetcher, FetchOptions}                                                                                         from './Fetcher';
 import {BuildDirective, BuildDirectiveType, Installer, InstallStatus}                                                  from './Installer';
@@ -154,6 +154,10 @@ const INSTALL_STATE_FIELDS = {
     `skippedBuilds`,
     `storedBuildState`,
   ] as const,
+
+  restoreCacheChecksums: [
+    `cacheChecksums`,
+  ] as const,
 };
 
 type RestoreInstallStateOpts = {
@@ -280,6 +284,13 @@ export class Project {
    * from an install to another.
    */
   public linkersCustomData: Map<string, unknown> = new Map();
+
+  /**
+   * Checksums of the cache archives validated during the last fetch, along
+   * with a fingerprint of their file stats; used to avoid rehashing archives
+   * that didn't change since the last install.
+   */
+  public cacheChecksums: CacheChecksumStore = new Map();
 
   /**
    * Those checksums are used to detect whether the relevant files actually
@@ -1091,9 +1102,12 @@ export class Project {
   }
 
   async fetchEverything({cache, report, fetcher: userFetcher, mode, persistProject = true}: InstallOptions) {
+    const checksumStore: CacheChecksumStore = new Map(this.cacheChecksums);
+
     const cacheOptions = {
       mockedPackages: this.disabledLocators,
       unstablePackages: this.conditionalLocators,
+      checksumStore,
     };
 
     const fetcher = userFetcher || this.configuration.makeFetcher();
@@ -1158,6 +1172,15 @@ export class Project {
 
     if (firstError)
       throw firstError;
+
+    // Only keep the entries for the archives that are still in use (unless we
+    // only fetched a subset of them), in a stable order so that the install
+    // state doesn't change needlessly
+    const usedChecksums = mode !== InstallMode.UpdateLockfile
+      ? [...checksumStore].filter(([path]) => cache.markedFiles.has(path))
+      : [...checksumStore];
+
+    this.cacheChecksums = new Map(miscUtils.sortMap(usedChecksums, ([path]) => path));
 
     const cleanInfo = persistProject && mode !== InstallMode.UpdateLockfile
       ? await this.cacheCleanup({cache, report})
@@ -2044,12 +2067,15 @@ export class Project {
     const installStatePath = this.configuration.get(`installStatePath`);
 
     await xfs.mkdirPromise(ppath.dirname(installStatePath), {recursive: true});
-    await xfs.writeFilePromise(installStatePath, await gzip(serializedState) as Buffer);
+    // The install state can get quite large in big projects; the fastest
+    // compression level is much faster than the default one, for a negligible
+    // size difference
+    await xfs.writeFilePromise(installStatePath, await gzip(serializedState, {level: 1}) as Buffer);
 
     this.installStateChecksum = newInstallStateChecksum;
   }
 
-  async restoreInstallState({restoreLinkersCustomData = true, restoreResolutions = true, restoreBuildState = true}: RestoreInstallStateOpts = {}) {
+  async restoreInstallState({restoreLinkersCustomData = true, restoreResolutions = true, restoreBuildState = true, restoreCacheChecksums = true}: RestoreInstallStateOpts = {}) {
     const installStatePath = this.configuration.get(`installStatePath`);
 
     let installState: InstallState;
@@ -2071,6 +2097,10 @@ export class Project {
 
     if (restoreBuildState)
       Object.assign(this, pick(installState, INSTALL_STATE_FIELDS.restoreBuildState));
+
+    if (restoreCacheChecksums)
+      if (typeof installState.cacheChecksums !== `undefined`)
+        this.cacheChecksums = installState.cacheChecksums;
 
     // Resolutions needs to be restored last otherwise applyLightResolution will persist a new state
     // before the rest is restored

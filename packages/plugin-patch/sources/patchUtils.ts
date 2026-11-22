@@ -314,6 +314,26 @@ export async function diffFolders(folderA: PortablePath, folderB: PortablePath) 
     .replace(new RegExp(miscUtils.escapeRegExp(`${folderBN}/`), `g`), ``);
 }
 
+// The same patch files (in particular the builtin ones, which can be quite
+// large) get hashed once per descriptor that uses them, so we cache the
+// result of their parsing.
+const patchHashPartsCache = new Map<string, Array<{semverExclusivity: string | null, serialized: string}>>();
+
+function getPatchHashParts(source: string) {
+  let parts = patchHashPartsCache.get(source);
+
+  if (typeof parts === `undefined`) {
+    parts = parsePatchFile(source).map(({semverExclusivity, ...effectWithoutRange}) => ({
+      semverExclusivity,
+      serialized: JSON.stringify(effectWithoutRange),
+    }));
+
+    patchHashPartsCache.set(source, parts);
+  }
+
+  return parts;
+}
+
 export function makePatchHash(
   patchFiles: Array<{
     source: string | null;
@@ -326,10 +346,7 @@ export function makePatchHash(
   for (const {source} of patchFiles) {
     if (source === null) continue;
 
-    const effects = parsePatchFile(source);
-
-    for (const effect of effects) {
-      const {semverExclusivity, ...effectWithoutRange} = effect;
+    for (const {semverExclusivity, serialized} of getPatchHashParts(source)) {
       if (
         semverExclusivity !== null &&
         sourceVersion !== null &&
@@ -337,7 +354,7 @@ export function makePatchHash(
       )
         continue;
 
-      parts.push(JSON.stringify(effectWithoutRange));
+      parts.push(serialized);
     }
   }
 

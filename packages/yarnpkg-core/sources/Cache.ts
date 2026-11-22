@@ -37,12 +37,34 @@ export const CACHE_VERSION = miscUtils.parseInt(
   10,
 );
 
+/**
+ * Remembers the checksum of the cache archives we already hashed, along with
+ * a fingerprint of their file stats at the time. As long as the fingerprint
+ * of an archive doesn't change we can reuse its checksum instead of hashing
+ * the whole file again (similar to what git does with its index).
+ */
+export type CacheChecksumStore = Map<PortablePath, {
+  fingerprint: string;
+  checksum: string;
+}>;
+
 export type CacheOptions = {
   mockedPackages?: Set<LocatorHash>;
   unstablePackages?: Set<LocatorHash>;
 
   mirrorWriteOnly?: boolean;
   skipIntegrityCheck?: boolean;
+
+  /**
+   * If set, checksums of archives already present in the cache will be read
+   * from (and written to) this store, keyed by their path, as long as their
+   * file stats didn't change since they were last hashed.
+   */
+  checksumStore?: CacheChecksumStore;
+};
+
+const getChecksumFingerprint = (stat: {size: number, mtimeMs: number, ctimeMs: number, ino: number}) => {
+  return `${stat.size}/${stat.mtimeMs}/${stat.ctimeMs}/${stat.ino}`;
 };
 
 export class Cache {
@@ -267,6 +289,31 @@ export class Cache {
       controlPath?: PortablePath | null;
     };
 
+    // Stats of the archive found in the cache, if we already retrieved them
+    let cacheFileStat: fs.Stats | null = null;
+
+    const checksumCacheFile = async (path: PortablePath, {canUseStore}: {canUseStore: boolean}) => {
+      const checksumStore = opts.checksumStore;
+
+      // When explicitly asked to check the cache we always rehash everything
+      if (!checksumStore || !canUseStore || this.check)
+        return await hashUtils.checksumFile(path);
+
+      // The stat must happen before the hash; if the file gets modified
+      // in-between, its next stat won't match and we'll hash it again
+      const stat = cacheFileStat ?? await baseFs.statPromise(path);
+      const fingerprint = getChecksumFingerprint(stat);
+
+      const stored = checksumStore.get(path);
+      if (stored?.fingerprint === fingerprint)
+        return stored.checksum;
+
+      const checksum = await hashUtils.checksumFile(path);
+      checksumStore.set(path, {fingerprint, checksum});
+
+      return checksum;
+    };
+
     const validateFile = async (path: PortablePath, {isColdHit, controlPath = null}: ValidateFileOptions): Promise<{isValid: boolean, hash: string | null}> => {
       // We hide the checksum if the package presence is conditional, because it becomes unreliable
       // so there is no point in computing it unless we're checking the cache
@@ -278,7 +325,7 @@ export class Cache {
         : this.cacheKey;
 
       const actualChecksum = (!opts.skipIntegrityCheck || !expectedChecksum)
-        ? `${actualCacheKey}/${await hashUtils.checksumFile(path)}`
+        ? `${actualCacheKey}/${await checksumCacheFile(path, {canUseStore: !isColdHit && controlPath === null})}`
         : expectedChecksum;
 
       if (controlPath !== null) {
@@ -401,6 +448,13 @@ export class Cache {
 
       await Promise.all(copyProcess.map(copy => copy()));
 
+      // We just wrote the archive ourselves, so we already know its checksum;
+      // no need to hash it again during the next install
+      if (opts.checksumStore && checksum !== null && finalPath === cachePath) {
+        const fingerprint = getChecksumFingerprint(await baseFs.statPromise(cachePath));
+        opts.checksumStore.set(cachePath, {fingerprint, checksum: splitChecksumComponents(checksum).hash});
+      }
+
       return [false, finalPath, checksum] as const;
     };
 
@@ -412,8 +466,14 @@ export class Cache {
           ? this.getLocatorPath(locator, expectedChecksum)
           : null;
 
+        // When we can reuse memoized checksums we'll need to stat the archive
+        // anyway, so we do it right away rather than just checking it exists
+        const canReuseStat = !!opts.checksumStore && !this.check;
+
         const cacheFileExists = tentativeCachePath !== null
-          ? this.markedFiles.has(tentativeCachePath) || await baseFs.existsPromise(tentativeCachePath)
+          ? this.markedFiles.has(tentativeCachePath) || (canReuseStat
+            ? (cacheFileStat = await baseFs.statPromise(tentativeCachePath).catch(() => null)) !== null
+            : await baseFs.existsPromise(tentativeCachePath))
           : false;
 
         const shouldMock = !!opts.mockedPackages?.has(locator.locatorHash) && (!this.check || !cacheFileExists);
