@@ -1386,17 +1386,17 @@ describe(`Node_Modules`, () => {
           },
         });
 
-        await writeFile(`${path}/.yarnrc.yml`, `nodeLinker: node-modules\nnmMode: hardlinks-local\n`);
+        await writeFile(`${path}/.yarnrc.yml`, `nodeLinker: node-modules\nnmMode: hardlinks-local\nnmSpareTree: false\n`);
         await run(`install`);
 
         expect(await xfs.statPromise(`${path}/ws3/node_modules/no-deps/package.json` as PortablePath)).toMatchObject({nlink: 2});
 
-        await writeFile(`${path}/.yarnrc.yml`, `nodeLinker: node-modules\nnmMode: classic\n`);
+        await writeFile(`${path}/.yarnrc.yml`, `nodeLinker: node-modules\nnmMode: classic\nnmSpareTree: false\n`);
         await run(`install`);
 
         expect(await xfs.statPromise(`${path}/ws3/node_modules/no-deps/package.json` as PortablePath)).toMatchObject({nlink: 1});
 
-        await writeFile(`${path}/.yarnrc.yml`, `nodeLinker: node-modules\nnmMode: hardlinks-local\n`);
+        await writeFile(`${path}/.yarnrc.yml`, `nodeLinker: node-modules\nnmMode: hardlinks-local\nnmSpareTree: false\n`);
         await run(`install`);
 
         expect(await xfs.statPromise(`${path}/ws3/node_modules/no-deps/package.json` as PortablePath)).toMatchObject({nlink: 2});
@@ -1525,6 +1525,8 @@ describe(`Node_Modules`, () => {
       {
         nodeLinker: `node-modules`,
         nmMode: `hardlinks-global`,
+        // node_modules is removed to force reading the store, which a spare tree would otherwise prevent
+        nmSpareTree: false,
       },
       async ({path, run}) => {
         await run(`install`);

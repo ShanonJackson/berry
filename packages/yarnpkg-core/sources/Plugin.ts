@@ -136,6 +136,20 @@ export interface Hooks {
   ) => Promise<boolean>;
 
   /**
+   * Called when computing the key that decides whether an install can be
+   * skipped (see `isInstallUpToDate`), for each package that comes neither
+   * from the npm registry nor from a workspace. The plugin that handles the
+   * package returns a string that changes whenever installing it could give
+   * a different result (for instance the content of its patch files), or
+   * `null` if it can't tell. Installs that involve a package that no plugin
+   * vouches for are never skipped.
+   */
+  getUpToDateKeyPart?: (
+    project: Project,
+    locator: Locator,
+  ) => Promise<string | null | void>;
+
+  /**
    * Called after the `install` method from the `Project` class successfully
    * completed.
    */

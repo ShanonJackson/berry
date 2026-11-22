@@ -1,6 +1,20 @@
 import {Filename, PortablePath, ppath, xfs} from '@yarnpkg/fslib';
 
 const UP_TO_DATE = /Already up to date/;
+
+const NO_DEPS_PATCH = `diff --git a/index.js b/index.js
+index bb9c6f687..5b141d3df 100644
+--- a/index.js
++++ b/index.js
+@@ -1,5 +1,7 @@
+ module.exports = require(\`./package.json\`);
+
++module.exports.hello = \`world\`;
++
+ for (const key of [\`dependencies\`, \`devDependencies\`, \`peerDependencies\`]) {
+   for (const dep of Object.keys(module.exports[key] || {})) {
+     module.exports[key][dep] = require(dep);
+`;
 const RESOLUTION_STEP = /Resolution step/;
 
 // The test environment uses a local cache by default, which isn't eligible
@@ -267,6 +281,143 @@ describe(`Features`, () => {
         expect(stdout).not.toMatch(UP_TO_DATE);
 
         await expect(source(`require('dep')`)).resolves.toEqual(2);
+      }),
+    );
+
+    test(`it should skip a focused install when nothing changed, but not a regular install after it`,
+      makeTemporaryEnv({
+        private: true,
+        workspaces: [`packages/*`],
+      }, CONFIG, async ({path, run}) => {
+        const fooCwd = ppath.join(path, `packages/foo` as PortablePath);
+        const barCwd = ppath.join(path, `packages/bar` as PortablePath);
+
+        await xfs.mkdirPromise(fooCwd, {recursive: true});
+        await xfs.writeJsonPromise(ppath.join(fooCwd, Filename.manifest), {name: `foo`, dependencies: {[`no-deps`]: `1.0.0`}});
+        await xfs.mkdirPromise(barCwd, {recursive: true});
+        await xfs.writeJsonPromise(ppath.join(barCwd, Filename.manifest), {name: `bar`, dependencies: {[`one-fixed-dep`]: `1.0.0`}});
+
+        await run(`install`);
+
+        await run(`workspaces`, `focus`, {cwd: fooCwd});
+        await expect(run(`workspaces`, `focus`, {cwd: fooCwd})).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+        expect(xfs.existsSync(ppath.join(path, `node_modules/one-fixed-dep` as PortablePath))).toEqual(false);
+
+        // The focused install left the dependencies of bar out, which a regular install has to bring back
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
+        expect(xfs.existsSync(ppath.join(path, `node_modules/one-fixed-dep` as PortablePath))).toEqual(true);
+      }),
+    );
+
+    test(`it should skip focused installs of projects using a local cache`,
+      makeTemporaryEnv({
+        private: true,
+        workspaces: [`packages/*`],
+      }, {
+        nodeLinker: `node-modules`,
+        enableGlobalCache: false,
+      }, async ({path, run}) => {
+        const fooCwd = ppath.join(path, `packages/foo` as PortablePath);
+
+        await xfs.mkdirPromise(fooCwd, {recursive: true});
+        await xfs.writeJsonPromise(ppath.join(fooCwd, Filename.manifest), {name: `foo`, dependencies: {[`no-deps`]: `1.0.0`}});
+
+        // Focused installs don't write the lockfile
+        await run(`install`);
+
+        await run(`workspaces`, `focus`, {cwd: fooCwd});
+        await expect(run(`workspaces`, `focus`, {cwd: fooCwd})).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+      }),
+    );
+
+    test(`it should not skip an install when a patch file changed`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `patch:no-deps@1.0.0#my-patch.patch`},
+      }, CONFIG, async ({path, run, source}) => {
+        const patchPath = ppath.join(path, `my-patch.patch` as PortablePath);
+        await xfs.writeFilePromise(patchPath, NO_DEPS_PATCH);
+
+        await run(`install`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+
+        await xfs.writeFilePromise(patchPath, NO_DEPS_PATCH.replace(`world`, `there`));
+
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
+        await expect(source(`require('no-deps').hello`)).resolves.toEqual(`there`);
+      }),
+    );
+
+    test(`it should not skip an install when the manifest of a linked folder changed`,
+      makeTemporaryEnv({
+        dependencies: {[`dep`]: `link:./dep`},
+      }, CONFIG, async ({path, run}) => {
+        const depManifestPath = ppath.join(path, `dep/package.json` as PortablePath);
+        await xfs.mkdirPromise(ppath.dirname(depManifestPath));
+        await xfs.writeJsonPromise(depManifestPath, {name: `dep`});
+
+        await run(`install`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+
+        await xfs.writeJsonPromise(depManifestPath, {name: `dep`, bin: `cli.js`});
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
+      }),
+    );
+
+    test(`it should not skip installs from commands that change resolutions first`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `^1.0.0`},
+      }, CONFIG, async ({path, run}) => {
+        await run(`install`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+
+        // Changes the resolution in memory, without changing the manifest nor (until it's written) the lockfile
+        await expect(run(`set`, `resolution`, `no-deps@npm:^1.0.0`, `npm:1.0.0`)).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
+        await expect(xfs.readFilePromise(ppath.join(path, Filename.lockfile), `utf8`)).resolves.toContain(`no-deps@npm:1.0.0`);
+      }),
+    );
+
+    test(`it should not skip a focused install that resolved packages the lockfile doesn't list`,
+      makeTemporaryEnv({
+        private: true,
+        workspaces: [`packages/*`],
+      }, CONFIG, async ({path, run, source}) => {
+        const fooCwd = ppath.join(path, `packages/foo` as PortablePath);
+        const depCwd = ppath.join(path, `dep` as PortablePath);
+
+        await xfs.mkdirPromise(fooCwd, {recursive: true});
+        await xfs.writeJsonPromise(ppath.join(fooCwd, Filename.manifest), {name: `foo`});
+        await xfs.mkdirPromise(depCwd);
+        await xfs.writeJsonPromise(ppath.join(depCwd, Filename.manifest), {name: `dep`, version: `1.0.0`});
+        await xfs.writeFilePromise(ppath.join(depCwd, `index.js` as Filename), `module.exports = 1;\n`);
+
+        await run(`install`);
+
+        // Focused installs don't write the lockfile, so it never lists this dependency
+        await xfs.writeJsonPromise(ppath.join(fooCwd, Filename.manifest), {name: `foo`, dependencies: {[`dep`]: `file:../../dep`}});
+        await run(`workspaces`, `focus`, {cwd: fooCwd});
+
+        await xfs.writeFilePromise(ppath.join(depCwd, `index.js` as Filename), `module.exports = 2;\n`);
+        await expect(run(`workspaces`, `focus`, {cwd: fooCwd})).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
+
+        await expect(source(`require('dep')`, {cwd: fooCwd})).resolves.toEqual(2);
+      }),
+    );
+
+    test(`it should not skip an install when a plugin changed`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, CONFIG, async ({path, run}) => {
+        const pluginPath = ppath.join(path, `plugin.cjs` as Filename);
+        const writePlugin = (version: number) => xfs.writeFilePromise(pluginPath, `module.exports = {name: \`my-plugin\`, factory: () => ({}), version: ${version}};\n`);
+
+        await writePlugin(1);
+        await xfs.writeFilePromise(ppath.join(path, Filename.rc), `plugins:\n  - ./plugin.cjs\n`, {flag: `a`});
+
+        await run(`install`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+
+        await writePlugin(2);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
       }),
     );
   });
