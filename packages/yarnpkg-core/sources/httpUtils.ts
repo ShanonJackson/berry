@@ -21,6 +21,9 @@ const fileCache = new Map<PortablePath, Promise<Buffer> | Buffer>();
 const globalHttpAgent = new HttpAgent({keepAlive: true});
 const globalHttpsAgent = new HttpsAgent({keepAlive: true});
 
+const httpProxyAgents = new Map<string, HttpProxyAgent>();
+const httpsProxyAgents = new Map<string, HttpsProxyAgent>();
+
 async function getCachedFile(filePath: PortablePath) {
   return miscUtils.getFactoryWithDefault(fileCache, filePath, () => {
     return xfs.readFilePromise(filePath).then(file => {
@@ -278,20 +281,26 @@ async function requestImpl(target: string | URL, body: Body, {configuration, hea
     key,
   };
 
+  // Proxy agents are kept across requests (with keep-alive), like the global agents; creating one per request meant
+  // that every request through a proxy opened a new tunnel and did a full TLS handshake
+  const proxyAgentKey = JSON.stringify([rejectUnauthorized, httpsCaFilePath, httpsCertFilePath, httpsKeyFilePath]);
+
   const agent = {
     http: networkConfig.httpProxy
-      ? new HttpProxyAgent({
-        proxy: networkConfig.httpProxy,
+      ? miscUtils.getFactoryWithDefault(httpProxyAgents, `${networkConfig.httpProxy}|${proxyAgentKey}`, () => new HttpProxyAgent({
+        keepAlive: true,
+        proxy: networkConfig.httpProxy!,
         // @ts-expect-error: hpagent actually supports all RequestOptions, but the types don't reflect that
         proxyRequestOptions,
-      })
+      }))
       : globalHttpAgent,
     https: networkConfig.httpsProxy
-      ? new HttpsProxyAgent({
-        proxy: networkConfig.httpsProxy,
+      ? miscUtils.getFactoryWithDefault(httpsProxyAgents, `${networkConfig.httpsProxy}|${proxyAgentKey}`, () => new HttpsProxyAgent({
+        keepAlive: true,
+        proxy: networkConfig.httpsProxy!,
         // @ts-expect-error: hpagent actually supports all RequestOptions, but the types don't reflect that
         proxyRequestOptions,
-      })
+      }))
       : globalHttpsAgent,
   };
 

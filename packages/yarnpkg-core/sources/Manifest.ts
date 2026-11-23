@@ -46,6 +46,12 @@ export interface InstallConfig {
 export class Manifest {
   public indent: string = `  `;
 
+  /**
+   * The text the manifest was loaded from (if loaded from a file), which lets
+   * callers skip writing it back when it didn't change.
+   */
+  public loadedText: string | null = null;
+
   public name: Ident | null = null;
   public version: string | null = null;
   public os: Array<string> | null = null;
@@ -158,6 +164,7 @@ export class Manifest {
 
     this.load(data);
     this.indent = getIndent(content);
+    this.loadedText = content;
   }
 
   load(data: any, {yamlCompatibilityMode = false}: {yamlCompatibilityMode?: boolean} = {}) {

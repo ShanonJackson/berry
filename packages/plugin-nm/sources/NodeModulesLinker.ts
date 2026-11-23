@@ -1686,6 +1686,8 @@ async function persistNodeModulesWith(materializer: Materializer | null, preinst
   }
 }
 
+const BIN_SYMLINKS_CONCURRENCY = 32;
+
 async function persistBinSymlinks(previousBinSymlinks: BinSymlinkMap, binSymlinks: BinSymlinkMap, projectCwd: PortablePath, windowsLinkType: WindowsLinkType) {
   // Delete outdated .bin folders
   for (const location of previousBinSymlinks.keys()) {
@@ -1697,7 +1699,17 @@ async function persistBinSymlinks(previousBinSymlinks: BinSymlinkMap, binSymlink
     }
   }
 
-  for (const [location, symlinks] of binSymlinks) {
+  // Each location has its own .bin folder, so they can be processed concurrently (it used to be one syscall at a time)
+  const locations = [...binSymlinks];
+  let nextLocation = 0;
+  await Promise.all(Array.from({length: Math.min(BIN_SYMLINKS_CONCURRENCY, locations.length)}, async () => {
+    while (nextLocation < locations.length) {
+      const [location, symlinks] = locations[nextLocation++];
+      await persistLocationBinSymlinks(location, symlinks);
+    }
+  }));
+
+  async function persistLocationBinSymlinks(location: PortablePath, symlinks: Map<Filename, PortablePath>) {
     if (ppath.contains(projectCwd, location) === null)
       throw new Error(`Assertion failed. Excepted bin symlink location to be inside project dir, instead it was at ${location}`);
     const binDir = ppath.join(location, NODE_MODULES, DOT_BIN);

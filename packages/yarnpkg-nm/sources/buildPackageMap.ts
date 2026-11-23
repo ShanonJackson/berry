@@ -146,7 +146,28 @@ const buildPackageMapFromDependencyFilter = (nodeModulesTree: NodeModulesTree, {
       const nodeModulesPath = ppath.join(currentPath, NODE_MODULES);
       const packageLocations = packageLocationsByNodeModulesPath.get(nodeModulesPath);
 
-      if (typeof packageLocations !== `undefined`) {
+      if (typeof packageLocations !== `undefined` && dependencyNames !== null) {
+        // Look up each dependency instead of scanning every package of the folder (which made the whole
+        // map quadratic, as most locations end up scanning the thousands of packages hoisted to the top)
+        for (const dependencyName of dependencyNames) {
+          if (dependencies.has(dependencyName))
+            continue;
+
+          const dependencyLocation = packageLocations.get(dependencyName);
+          if (typeof dependencyLocation === `undefined`)
+            continue;
+
+          const dependency = packageMapNodes.get(dependencyLocation);
+          if (typeof dependency === `undefined`)
+            throw new Error(`Assertion failed: Expected ${dependencyLocation} to have been registered`);
+
+          dependencies.set(dependencyName, dependency.id);
+        }
+
+        if (dependencies.size === dependencyNames.size) {
+          break;
+        }
+      } else if (typeof packageLocations !== `undefined`) {
         for (const [dependencyName, dependencyLocation] of packageLocations) {
           if (dependencyNames !== null && !dependencyNames.has(dependencyName))
             continue;

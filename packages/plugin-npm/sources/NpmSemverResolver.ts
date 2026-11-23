@@ -22,16 +22,40 @@ const NODE_GYP_MATCH = /\b(node-gyp|prebuild-install)\b/;
  * scoped to `*` to avoid changing the semantics of other ranges.
  * See https://github.com/yarnpkg/berry/issues/6469.
  */
-export function selectMatchingVersions(range: semver.Range, versions: Array<string>) {
-  const match = (matchRange: semver.Range) => miscUtils.mapAndFilter(versions, version => {
-    try {
-      const candidate = new semverUtils.SemVer(version);
-      if (matchRange.test(candidate)) {
-        return candidate;
-      }
-    } catch { }
+// Parsing every version of a package for every range that targets it made resolutions O(ranges * versions) in
+// version parsing; the parsed versions are now kept for as long as the metadata they come from
+const parsedVersionsCache = new WeakMap<object, Array<semver.SemVer>>();
 
-    return miscUtils.mapAndFilter.skip;
+function getParsedVersions(versions: Record<string, unknown>) {
+  let parsed = parsedVersionsCache.get(versions);
+  if (typeof parsed === `undefined`) {
+    parsed = miscUtils.mapAndFilter(Object.keys(versions), version => {
+      try {
+        return new semverUtils.SemVer(version);
+      } catch {
+        return miscUtils.mapAndFilter.skip;
+      }
+    });
+
+    parsedVersionsCache.set(versions, parsed);
+  }
+
+  return parsed;
+}
+
+export function selectMatchingVersions(range: semver.Range, versions: Array<string> | Record<string, unknown>) {
+  const parsedVersions = Array.isArray(versions)
+    ? miscUtils.mapAndFilter(versions, version => {
+      try {
+        return new semverUtils.SemVer(version);
+      } catch {
+        return miscUtils.mapAndFilter.skip;
+      }
+    })
+    : getParsedVersions(versions);
+
+  const match = (matchRange: semver.Range) => parsedVersions.filter(candidate => {
+    return matchRange.test(candidate);
   });
 
   const matched = match(range);
@@ -84,7 +108,7 @@ export class NpmSemverResolver implements Resolver {
       version: semver.valid(range.raw) ? range.raw : undefined,
     });
 
-    const semverCandidates = selectMatchingVersions(range, Object.keys(registryData.versions));
+    const semverCandidates = selectMatchingVersions(range, registryData.versions);
 
     const candidates = semverCandidates.filter(candidate => {
       return isPackageApproved({configuration: opts.project.configuration, ident: descriptor, version: candidate.raw, publishTimes: registryData.time});

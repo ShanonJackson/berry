@@ -221,9 +221,14 @@ export class Workspace {
     const path = ppath.join(this.cwd, Manifest.fileName);
     const content = `${JSON.stringify(data, null, this.manifest.indent)}\n`;
 
-    await xfs.changeFilePromise(path, content, {
-      automaticNewlines: true,
-    });
+    // Large monorepos have thousands of workspaces, nearly all of them unchanged by an install
+    if (content !== this.manifest.loadedText) {
+      await xfs.changeFilePromise(path, content, {
+        automaticNewlines: true,
+      });
+
+      this.manifest.loadedText = content;
+    }
 
     this.manifest.raw = data;
   }
