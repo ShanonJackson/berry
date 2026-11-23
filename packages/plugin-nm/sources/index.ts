@@ -7,9 +7,6 @@ import {getDirCloneStore}                   from './NodeModulesLinker';
 import {getGlobalHardlinksStore}            from './NodeModulesLinker';
 import {isNodeModulesUpToDate}              from './NodeModulesLinker';
 import {PnpLooseLinker}                     from './PnpLooseLinker';
-import {getSpareTreeStore}                  from './spareTree';
-import {refreshSpareTrees}                  from './spareTree';
-import {spareTreeInstalls}                  from './spareTree';
 
 export {NodeModulesLinker};
 export {NodeModulesMode};
@@ -21,7 +18,6 @@ declare module '@yarnpkg/core' {
     nmHoistingLimits: NodeModulesHoistingLimits;
     nmMode: NodeModulesMode;
     nmSelfReferences: boolean;
-    nmSpareTree: boolean;
   }
 }
 
@@ -31,21 +27,12 @@ const plugin: Plugin<Hooks> = {
       const globalHardlinksDirectory = getGlobalHardlinksStore(configuration);
       await xfs.removePromise(globalHardlinksDirectory);
       await xfs.removePromise(getDirCloneStore(configuration));
-      await xfs.removePromise(getSpareTreeStore(configuration));
     },
     isInstallUpToDate: async (upToDate, project) => {
       if (project.configuration.get(`nodeLinker`) !== `node-modules`)
         return upToDate;
 
       return await isNodeModulesUpToDate(project);
-    },
-    afterAllInstalled: async project => {
-      const spareTreeInstall = spareTreeInstalls.get(project);
-      if (typeof spareTreeInstall === `undefined`)
-        return;
-
-      spareTreeInstalls.delete(project);
-      await refreshSpareTrees(project, spareTreeInstall);
     },
   },
   configuration: {
@@ -76,11 +63,6 @@ const plugin: Plugin<Hooks> = {
     },
     nmSelfReferences: {
       description: `Defines whether the linker should generate self-referencing symlinks for workspaces.`,
-      type: SettingsType.BOOLEAN,
-      default: true,
-    },
-    nmSpareTree: {
-      description: `If true, Yarn keeps a spare copy of each freshly installed \`node_modules\` folder in the global folder, and moves it into place the next time the folder is missing instead of writing every file again. The copy is made of hardlinks in the background after the install, so it shares the files of the folder (which means that removing the folder doesn't free their space until the next install), and is only used if none of its files changed since. Off by default on CI, and not available on Windows.`,
       type: SettingsType.BOOLEAN,
       default: true,
     },
