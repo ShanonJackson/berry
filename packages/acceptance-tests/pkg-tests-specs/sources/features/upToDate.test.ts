@@ -142,10 +142,7 @@ describe(`Features`, () => {
     test(`it should not skip an install when node_modules is missing`,
       makeTemporaryEnv({
         dependencies: {[`no-deps`]: `1.0.0`},
-      }, {
-        ...CONFIG,
-        nmSpareTree: false,
-      }, async ({path, run, source}) => {
+      }, CONFIG, async ({path, run, source}) => {
         await run(`install`);
 
         await xfs.removePromise(ppath.join(path, Filename.nodeModules));
