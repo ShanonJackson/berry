@@ -570,10 +570,18 @@ function runSpareTreeHelper(args: SpareTreeHelperArgs) {
   const env = {...process.env};
   delete env.NODE_OPTIONS;
 
-  const source = `(${spareTreeHelper.toString()})(JSON.parse(process.argv[1]), require('fs'), require('path'), require('os'))`;
+  // The arguments go through a file: in large monorepos they exceed the size limit of a single command-line argument
+  // (128KB on Linux), which makes spawn fail with E2BIG. The `.tmp` suffix lets the store's garbage collection remove
+  // the file if the helper never gets to it
+  const source = `(() => { const fs = require('fs'); const argsPath = process.argv[1]; let args; try { args = JSON.parse(fs.readFileSync(argsPath, 'utf8')); } finally { try { fs.unlinkSync(argsPath); } catch {} } (${spareTreeHelper.toString()})(args, fs, require('path'), require('os')); })()`;
 
   try {
-    const child = spawn(process.execPath, [`-e`, source, JSON.stringify(args)], {
+    const argsDir = typeof args.store !== `undefined` ? npath.fromPortablePath(args.store) : os.tmpdir();
+    const argsPath = `${argsDir}/${getUniqueSuffix()}.args.tmp`;
+    fs.mkdirSync(argsDir, {recursive: true});
+    fs.writeFileSync(argsPath, JSON.stringify(args));
+
+    const child = spawn(process.execPath, [`-e`, source, argsPath], {
       detached: true,
       stdio: `ignore`,
       windowsHide: true,
