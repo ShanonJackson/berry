@@ -288,6 +288,52 @@ describe(`Project`, () => {
     });
   });
 
+  it(`should find workspaces from paths like fast-glob does`, async () => {
+    await xfs.mktempPromise(async dir => {
+      const writeWorkspace = async (relativePath: string, workspaces?: Array<string>) => {
+        await xfs.mkdirpPromise(ppath.join(dir, relativePath as PortablePath));
+        await xfs.writeJsonPromise(ppath.join(dir, relativePath as PortablePath, Filename.manifest), {name: ppath.basename(relativePath as PortablePath).replace(/[^a-z]/g, ``) || `x`, workspaces});
+      };
+
+      await writeWorkspace(`shared/a`);
+      await writeWorkspace(`shared/b`);
+      await writeWorkspace(`shared/f(o)o`);
+      await xfs.writeFilePromise(ppath.join(dir, Filename.lockfile), ``);
+
+      const getWorkspaces = async (workspaces: Array<string>) => {
+        await xfs.writeJsonPromise(ppath.join(dir, Filename.manifest), {name: `root`, workspaces});
+        const {project} = await Project.find(getConfiguration(dir), dir);
+        return project.workspaces.map(workspace => workspace.relativeCwd);
+      };
+
+      // Negated patterns apply to paths too
+      await expect(getWorkspaces([`shared/a`, `shared/b`, `!shared/b`])).resolves.toEqual([`.`, `shared/a`]);
+
+      // Names that fast-glob reads as patterns
+      await expect(getWorkspaces([`shared/f(o)o`])).resolves.toEqual([`.`]);
+
+      // Paths reaching out of a nested workspace
+      await writeWorkspace(`product`, [`../shared/a`, `../shared/b`]);
+      await expect(getWorkspaces([`product`])).resolves.toEqual([`.`, `product`, `shared/a`, `shared/b`]);
+    });
+  });
+
+  it(`should give a folder listed by a workspace and one of its descendants to the workspace`, async () => {
+    await xfs.mktempPromise(async dir => {
+      await xfs.writeJsonPromise(ppath.join(dir, Filename.manifest), {name: `root`, workspaces: [`a`, `shared`]});
+      await xfs.writeFilePromise(ppath.join(dir, Filename.lockfile), ``);
+      await xfs.mkdirpPromise(ppath.join(dir, `a` as PortablePath));
+      await xfs.writeJsonPromise(ppath.join(dir, `a`, Filename.manifest), {name: `a`, workspaces: [`../shared`, `x`]});
+      for (const name of [`shared`, `a/x`]) {
+        await xfs.mkdirpPromise(ppath.join(dir, name as PortablePath));
+        await xfs.writeJsonPromise(ppath.join(dir, name as PortablePath, Filename.manifest), {name: ppath.basename(name as PortablePath)});
+      }
+
+      const {project} = await Project.find(getConfiguration(dir), dir);
+      expect(project.workspaces.map(workspace => workspace.relativeCwd)).toEqual([`.`, `a`, `a/x`, `shared`]);
+    });
+  });
+
   it(`should give a folder listed by several workspaces to the first of them, whichever is set up first`, async () => {
     await xfs.mktempPromise(async dir => {
       await xfs.writeJsonPromise(ppath.join(dir, Filename.manifest), {name: `root`, workspaces: [`a`, `b`]});

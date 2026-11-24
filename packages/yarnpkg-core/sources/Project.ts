@@ -479,45 +479,48 @@ export class Project {
 
     const limitSetup = pLimit(4);
 
-    // Workspaces are set up in parallel (each one starts its children as soon as it's ready), but they're added in
-    // depth-first order. A folder that several workspaces list belongs to the first of them in that order rather than
-    // to whichever was set up first, so the workspace order doesn't depend on timing.
-    const setups = new Map<PortablePath, Promise<Workspace>>();
-    const setupWorkspace = (workspaceCwd: PortablePath): Promise<Workspace> => {
-      let setup = setups.get(workspaceCwd);
-      if (typeof setup === `undefined`) {
-        const workspace = new Workspace(workspaceCwd, {project: this});
-        setup = limitSetup(() => workspace.setup()).then(() => workspace);
-        setups.set(workspaceCwd, setup);
+    // Workspaces are set up level by level, in parallel. A folder that several workspaces list belongs to the first of
+    // them in that order (the closest to the root), never to whichever was set up first, and the workspaces are then
+    // added depth-first, so their order doesn't depend on timing.
+    const root = new Workspace(this.cwd, {project: this});
+    const children = new Map<Workspace, Array<Workspace>>();
+    const claimed = new Set<PortablePath>([this.cwd]);
 
-        setup.then(workspace => {
-          for (const childCwd of workspace.workspacesCwds) {
-            setupWorkspace(childCwd);
-          }
-        }, () => {
-          // Reported by the depth-first walk below, if it reaches this workspace
-        });
+    let level = [root];
+    while (level.length > 0) {
+      const results = await Promise.allSettled(level.map(workspace => limitSetup(() => workspace.setup())));
+      for (const result of results)
+        if (result.status === `rejected`)
+          throw result.reason;
+
+      const nextLevel: Array<Workspace> = [];
+      for (const workspace of level) {
+        const owned: Array<Workspace> = [];
+        for (const childCwd of workspace.workspacesCwds) {
+          if (claimed.has(childCwd))
+            continue;
+
+          claimed.add(childCwd);
+
+          const child = new Workspace(childCwd, {project: this});
+          owned.push(child);
+          nextLevel.push(child);
+        }
+
+        children.set(workspace, owned);
       }
 
-      return setup;
-    };
+      level = nextLevel;
+    }
 
-    const visited = new Set<PortablePath>();
-    const addWorkspaceTree = async (workspaceCwd: PortablePath): Promise<void> => {
-      if (visited.has(workspaceCwd))
-        return;
-
-      visited.add(workspaceCwd);
-
-      const workspace = await setupWorkspace(workspaceCwd);
+    const addWorkspaceTree = (workspace: Workspace) => {
       this.addWorkspace(workspace);
-
-      for (const childCwd of workspace.workspacesCwds) {
-        await addWorkspaceTree(childCwd);
+      for (const child of children.get(workspace)!) {
+        addWorkspaceTree(child);
       }
     };
 
-    await addWorkspaceTree(this.cwd);
+    addWorkspaceTree(root);
   }
 
   private addWorkspace(workspace: Workspace) {

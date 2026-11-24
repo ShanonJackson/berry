@@ -10,20 +10,38 @@ import * as semverUtils                            from './semverUtils';
 import * as structUtils                            from './structUtils';
 import {Descriptor, Locator}                       from './types';
 
+const LITERAL_PATH_REGEXP = /^[a-zA-Z0-9_@.\-/]+$/;
 const NON_LITERAL_SEGMENTS = new Set([``, `.`, `node_modules`, `.git`, `.yarn`]);
 
 /**
- * Tells whether fast-glob would return the pattern as it is, if it's a directory: a relative path without any glob
- * syntax, nor any segment that's ignored or that fast-glob would normalize.
+ * Tells whether fast-glob would return the pattern as it is (if it's a
+ * directory): a relative path made of common characters only, without any
+ * segment that fast-glob would ignore or normalize.
  */
 function isLiteralPath(pattern: string) {
-  if (fastGlob.isDynamicPattern(pattern))
-    return false;
+  return LITERAL_PATH_REGEXP.test(pattern) && pattern.split(`/`).every(segment => !NON_LITERAL_SEGMENTS.has(segment));
+}
 
-  if (pattern.startsWith(`/`) || pattern.includes(`\\`) || pattern.includes(`:`))
-    return false;
+/**
+ * Same check as fast-glob does for a pattern without glob syntax: only a
+ * missing path is skipped (other errors are thrown), and broken symlinks
+ * aren't directories.
+ */
+async function isLiteralDirectory(path: PortablePath) {
+  let stats;
+  try {
+    stats = await xfs.lstatPromise(path);
+  } catch (error) {
+    if (error.code === `ENOENT`)
+      return false;
 
-  return pattern.split(`/`).every(segment => !NON_LITERAL_SEGMENTS.has(segment));
+    throw error;
+  }
+
+  if (stats.isSymbolicLink())
+    stats = await xfs.statPromise(path).catch(() => stats!);
+
+  return stats.isDirectory();
 }
 
 export class Workspace {
@@ -69,19 +87,25 @@ export class Workspace {
     if (patterns.length === 0)
       return;
 
-    // Monorepos may list thousands of workspaces by their path, which don't need to go through fast-glob: the
-    // package.json check below already tells whether they're directories
-    const literalPaths = patterns.filter(isLiteralPath);
-    const globs = patterns.filter(pattern => !isLiteralPath(pattern));
+    // Monorepos may list thousands of workspaces by their path, which are much cheaper to check directly than through
+    // fast-glob (unless negated patterns may exclude some of them)
+    const hasNegations = patterns.some(pattern => pattern.startsWith(`!`));
+    const literalPaths = hasNegations ? [] : patterns.filter(isLiteralPath);
+    const globs = hasNegations ? patterns : patterns.filter(pattern => !isLiteralPath(pattern));
 
-    const globbedCwds = globs.length > 0 ? await fastGlob(globs, {
-      cwd: npath.fromPortablePath(this.cwd),
-      onlyDirectories: true,
-      ignore: [`**/node_modules`, `**/.git`, `**/.yarn`],
-    }) : [];
+    const [globbedCwds, literalDirectories] = await Promise.all([
+      globs.length > 0 ? fastGlob(globs, {
+        cwd: npath.fromPortablePath(this.cwd),
+        onlyDirectories: true,
+        ignore: [`**/node_modules`, `**/.git`, `**/.yarn`],
+      }) : [],
+      Promise.all(literalPaths.map(async literalPath => {
+        return await isLiteralDirectory(ppath.resolve(this.cwd, literalPath as PortablePath)) ? literalPath : null;
+      })),
+    ]);
 
     // fast-glob returns results in arbitrary order
-    const relativeCwds = [...new Set([...globbedCwds, ...literalPaths])].sort();
+    const relativeCwds = [...new Set([...globbedCwds, ...literalDirectories.filter((literalPath): literalPath is string => literalPath !== null)])].sort();
 
     await relativeCwds.reduce(async (previousTask, relativeCwd) => {
       const candidateCwd = ppath.resolve(this.cwd, npath.toPortablePath(relativeCwd));
