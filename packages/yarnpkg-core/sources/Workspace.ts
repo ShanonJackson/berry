@@ -10,6 +10,22 @@ import * as semverUtils                            from './semverUtils';
 import * as structUtils                            from './structUtils';
 import {Descriptor, Locator}                       from './types';
 
+const NON_LITERAL_SEGMENTS = new Set([``, `.`, `node_modules`, `.git`, `.yarn`]);
+
+/**
+ * Tells whether fast-glob would return the pattern as it is, if it's a directory: a relative path without any glob
+ * syntax, nor any segment that's ignored or that fast-glob would normalize.
+ */
+function isLiteralPath(pattern: string) {
+  if (fastGlob.isDynamicPattern(pattern))
+    return false;
+
+  if (pattern.startsWith(`/`) || pattern.includes(`\\`) || pattern.includes(`:`))
+    return false;
+
+  return pattern.split(`/`).every(segment => !NON_LITERAL_SEGMENTS.has(segment));
+}
+
 export class Workspace {
   public readonly project: Project;
   public readonly cwd: PortablePath;
@@ -53,14 +69,19 @@ export class Workspace {
     if (patterns.length === 0)
       return;
 
-    const relativeCwds = await fastGlob(patterns, {
+    // Monorepos may list thousands of workspaces by their path, which don't need to go through fast-glob: the
+    // package.json check below already tells whether they're directories
+    const literalPaths = patterns.filter(isLiteralPath);
+    const globs = patterns.filter(pattern => !isLiteralPath(pattern));
+
+    const globbedCwds = globs.length > 0 ? await fastGlob(globs, {
       cwd: npath.fromPortablePath(this.cwd),
       onlyDirectories: true,
       ignore: [`**/node_modules`, `**/.git`, `**/.yarn`],
-    });
+    }) : [];
 
     // fast-glob returns results in arbitrary order
-    relativeCwds.sort();
+    const relativeCwds = [...new Set([...globbedCwds, ...literalPaths])].sort();
 
     await relativeCwds.reduce(async (previousTask, relativeCwd) => {
       const candidateCwd = ppath.resolve(this.cwd, npath.toPortablePath(relativeCwd));

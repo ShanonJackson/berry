@@ -254,6 +254,40 @@ describe(`Project`, () => {
     });
   });
 
+  it(`should find the same workspaces from paths as from globs`, async () => {
+    await xfs.mktempPromise(async dir => {
+      const writeWorkspace = async (relativePath: string) => {
+        await xfs.mkdirpPromise(ppath.join(dir, relativePath as PortablePath));
+        await xfs.writeJsonPromise(ppath.join(dir, relativePath as PortablePath, Filename.manifest), {name: ppath.basename(relativePath as PortablePath)});
+      };
+
+      for (const name of [`a`, `b`, `c`, `nested/d`, `nested/e`, `node_modules/f`, `g`])
+        await writeWorkspace(`packages/${name}`);
+      await writeWorkspace(`elsewhere/h`);
+
+      await xfs.mkdirpPromise(ppath.join(dir, `packages/no-manifest` as PortablePath));
+      await xfs.writeFilePromise(ppath.join(dir, `packages/file` as PortablePath), ``);
+      await xfs.symlinkPromise(ppath.join(dir, `elsewhere/h` as PortablePath), ppath.join(dir, `packages/symlinked` as PortablePath));
+      await xfs.writeFilePromise(ppath.join(dir, Filename.lockfile), ``);
+
+      const getWorkspaces = async (workspaces: Array<string>) => {
+        await xfs.writeJsonPromise(ppath.join(dir, Filename.manifest), {name: `root`, workspaces});
+        const {project} = await Project.find(getConfiguration(dir), dir);
+        return project.workspaces.map(workspace => workspace.relativeCwd);
+      };
+
+      const globs = await getWorkspaces([`packages/*`, `packages/nested/*`, `packages/node_modules/*`]);
+      expect(globs).toEqual([`.`, `packages/a`, `packages/b`, `packages/c`, `packages/g`, `packages/nested/d`, `packages/nested/e`, `packages/node_modules/f`, `packages/symlinked`]);
+
+      const paths = await getWorkspaces([`packages/c`, `packages/a`, `packages/nested/d`, `packages/b`, `packages/nested/e`, `packages/g`, `packages/symlinked`, `packages/a`, `packages/no-manifest`, `packages/file`, `packages/missing`, `packages/node_modules/f`]);
+      expect(paths).toEqual(globs);
+
+      // Paths that fast-glob normalizes are still sorted as they're written
+      const mixed = await getWorkspaces([`./packages/c`, `packages/a`, `packages/nested/*`, `packages/b`, `packages/nested/d`, `packages/g/`, `packages/symlinked`]);
+      expect(mixed).toEqual([`.`, `packages/c`, `packages/a`, `packages/b`, `packages/g`, `packages/nested/d`, `packages/nested/e`, `packages/symlinked`]);
+    });
+  });
+
   it(`should give a folder listed by several workspaces to the first of them, whichever is set up first`, async () => {
     await xfs.mktempPromise(async dir => {
       await xfs.writeJsonPromise(ppath.join(dir, Filename.manifest), {name: `root`, workspaces: [`a`, `b`]});
