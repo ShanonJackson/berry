@@ -250,9 +250,8 @@ class NodeModulesInstaller implements Installer {
       }),
     });
 
-    const nmModeSetting = this.opts.project.configuration.get(`nmMode`);
-
     let preinstallState = await findInstallState(this.opts.project);
+    const nmModeSetting = this.opts.project.configuration.get(`nmMode`);
 
     // Remove build state as well, to force rebuild of all the packages
     if (preinstallState === null || nmModeSetting !== preinstallState.nmMode) {
@@ -369,6 +368,7 @@ class NodeModulesInstaller implements Installer {
     });
 
     this.customData.missingBinTargets = missingBinTargets;
+    this.customData.stateFileHash = await getStateFileHash(this.opts.project);
 
     const installStatuses: Array<FinalizeInstallStatus> = [];
 
@@ -414,6 +414,8 @@ type NodeModulesCustomData = {
   store: Map<LocatorHash, CustomPackageData>;
   // The binary targets that didn't exist during the last install, whose links an install would add if they appeared
   missingBinTargets?: Array<PortablePath>;
+  // The state file the last install wrote, which tells that node_modules comes from it (they're stored separately)
+  stateFileHash?: string | null;
 };
 
 // The content checksum of the package archive (used to address the global hardlinks store), without the cache key
@@ -904,9 +906,7 @@ async function copyFilePromise({srcPath, dstPath, entry, globalHardlinksStore, b
 
       let doesContentFileExist;
       try {
-        // The sync calls below are deliberate: each costs a few microseconds, which is less than
-        // a round-trip through the libuv threadpool, and this loop runs for every file of every package
-        const stats = xfs.statSync(contentFilePath);
+        const stats = await xfs.statPromise(contentFilePath);
 
         if (stats && (!entry.mtimeMs || stats.mtimeMs > entry.mtimeMs || stats.mtimeMs < entry.mtimeMs - MTIME_ACCURANCY)) {
           const contentDigest = await hashUtils.checksumFile(contentFilePath, {baseFs: xfs, algorithm: `sha1`});
@@ -934,7 +934,7 @@ async function copyFilePromise({srcPath, dstPath, entry, globalHardlinksStore, b
           }
         }
 
-        xfs.linkSync(contentFilePath, dstPath);
+        await xfs.linkPromise(contentFilePath, dstPath);
         doesContentFileExist = true;
       } catch {
         doesContentFileExist = false;
@@ -959,7 +959,7 @@ async function copyFilePromise({srcPath, dstPath, entry, globalHardlinksStore, b
     const mode = entry.mode & 0o777;
     // An optimization - files will have rw-r-r permissions (0o644) by default, we can skip chmod for them
     if (mode !== 0o644) {
-      xfs.chmodSync(dstPath, mode);
+      await xfs.chmodPromise(dstPath, mode);
     }
   }
 }
@@ -1005,7 +1005,8 @@ async function writePackageFromArchive(materializer: Materializer, dstDir: Porta
       const srcEntryPath = ppath.join(srcPath, entry.name);
 
       if (entry.isFile()) {
-        // A copy that owns its memory, since buffers often are views on larger ones (which messages would copy whole)
+        // Always a copy, since it's transferred to a worker: the buffer may be a view on a larger one, or one the
+        // archive keeps in its cache (transferring would empty it)
         const content = new Uint8Array(baseFs.readFileSync(srcEntryPath));
         batch.push({relativePath: npath.fromPortablePath(relativeEntryPath), kind: `file`, mode: baseFs.lstatSync(srcEntryPath).mode, content});
 
@@ -1144,11 +1145,13 @@ const copyPromise = async (dstDir: PortablePath, srcDir: PortablePath, {baseFs, 
  *
  * @returns location tree and bin symlinks with modules, unavailable on disk, removed
  */
-function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: BinSymlinkMap, stateMtimeMs: number, project: Project): {locationTree: LocationTree, binSymlinks: BinSymlinkMap, locatorLocations: Map<LocatorKey, Set<PortablePath>>, installChangedByUser: boolean} {
+function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: BinSymlinkMap, stateMtimeMs: number, project: Project): {locationTree: LocationTree, binSymlinks: BinSymlinkMap, locatorLocations: Map<LocatorKey, Set<PortablePath>>, installChangedByUser: boolean, somethingMissing: boolean} {
   const refinedLocationTree: LocationTree = new Map();
   const refinedBinSymlinks = new Map();
   const locatorLocations = new Map();
   let installChangedByUser = false;
+  // Whether something the last install wrote is gone (as opposed to only added to, which installs leave alone)
+  let somethingMissing = false;
 
   const syncNodeWithDisk = (parentPath: PortablePath, entry: Filename, parentNode: LocationNode, refinedNode: LocationNode, parentDiskEntries: Set<Filename>) => {
     let doesExistOnDisk = true;
@@ -1182,6 +1185,7 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
 
         if (!binStats) {
           installChangedByUser = true;
+          somethingMissing = true;
         } else if (binStats.mtimeMs > stateMtimeMs) {
           installChangedByUser = true;
 
@@ -1192,6 +1196,8 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
           for (const [entry, target] of binarySymlinks) {
             if (diskEntries.has(entry)) {
               refinedBinarySymlinks.set(entry, target);
+            } else {
+              somethingMissing = true;
             }
           }
         } else {
@@ -1216,8 +1222,11 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
       for (const childEntry of node.children.keys()) {
         syncNodeWithDisk(entryPath, childEntry, node, childRefinedNode, childDiskEntries);
       }
-    } else if (node.locator) {
-      project.storedBuildState.delete(structUtils.parseLocator(node.locator).locatorHash);
+    } else {
+      somethingMissing = true;
+      if (node.locator) {
+        project.storedBuildState.delete(structUtils.parseLocator(node.locator).locatorHash);
+      }
     }
   };
 
@@ -1236,7 +1245,7 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
     }
   }
 
-  return {locationTree: refinedLocationTree, binSymlinks: refinedBinSymlinks, locatorLocations, installChangedByUser};
+  return {locationTree: refinedLocationTree, binSymlinks: refinedBinSymlinks, locatorLocations, installChangedByUser, somethingMissing};
 }
 
 function isLinkLocator(locatorKey: LocatorKey): boolean {
@@ -1337,9 +1346,19 @@ export async function isNodeModulesUpToDate(project: Project): Promise<boolean> 
   if (preinstallState === null || preinstallState.nmMode !== nmModeSetting)
     return false;
 
-  // Same check as the one an install does to find out what the user changed on disk (removed packages, folders, binaries)
-  const {installChangedByUser} = syncPreinstallStateWithDisk(preinstallState.locationTree, preinstallState.binSymlinks, preinstallState.mtimeMs, project);
-  if (installChangedByUser)
+  // node_modules and the install state are written separately (an install may stop in between, and CI may restore
+  // them from different caches), so they must both come from the last install
+  const customData = project.linkersCustomData.get(new NodeModulesLinker().getCustomDataKey()) as NodeModulesCustomData | undefined;
+  if (!Array.isArray(customData?.missingBinTargets) || typeof customData.stateFileHash !== `string`)
+    return false;
+
+  if (await getStateFileHash(project) !== customData.stateFileHash)
+    return false;
+
+  // Same check as the one an install does to find out what the user changed on disk. The install only puts back what
+  // went missing (folders and files added since, such as caches, are left alone), so that's all that matters here
+  const {somethingMissing} = syncPreinstallStateWithDisk(preinstallState.locationTree, preinstallState.binSymlinks, preinstallState.mtimeMs, project);
+  if (somethingMissing)
     return false;
 
   // Binaries are only linked when their targets exist, so an install would remove the links of the targets that
@@ -1349,15 +1368,20 @@ export async function isNodeModulesUpToDate(project: Project): Promise<boolean> 
       if (!xfs.existsSync(ppath.resolve(target)))
         return false;
 
-  const customData = project.linkersCustomData.get(new NodeModulesLinker().getCustomDataKey()) as NodeModulesCustomData | undefined;
-  if (!Array.isArray(customData?.missingBinTargets))
-    return false;
-
   for (const target of customData.missingBinTargets)
     if (xfs.existsSync(target))
       return false;
 
   return true;
+}
+
+async function getStateFileHash(project: Project) {
+  try {
+    const content = await xfs.readFilePromise(ppath.join(project.cwd, NODE_MODULES, INSTALL_STATE_FILE));
+    return crypto.createHash(`sha1`).update(content).digest(`hex`);
+  } catch {
+    return null;
+  }
 }
 
 export function getGlobalHardlinksStore(configuration: Configuration): PortablePath {
@@ -1457,6 +1481,15 @@ async function persistNodeModulesWith(materializer: Materializer | null, preinst
     if (dir.split(ppath.sep).indexOf(NODE_MODULES) < 0)
       throw new Error(`Assertion failed: trying to remove dir that doesn't contain node_modules: ${dir}`);
 
+    // Most locations of a fresh install don't exist yet, and checking that here is cheaper than asking a worker
+    try {
+      xfs.lstatSync(dir);
+    } catch (error) {
+      if (error.code === `ENOENT`) {
+        return;
+      }
+    }
+
     await materializer.remove({dir: npath.fromPortablePath(dir), contentsOnly: options.contentsOnly, isWorkspaceDir: !!options.isWorkspaceDir});
   };
 
@@ -1519,7 +1552,7 @@ async function persistNodeModulesWith(materializer: Materializer | null, preinst
               }
             } else {
               if (nmMode.value === NodeModulesMode.HARDLINKS_LOCAL || nmMode.value === NodeModulesMode.HARDLINKS_GLOBAL) {
-                xfs.linkSync(src, dst);
+                await xfs.linkPromise(src, dst);
               } else {
                 await xfs.copyFilePromise(src, dst, fs.constants.COPYFILE_FICLONE);
               }

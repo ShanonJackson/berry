@@ -298,7 +298,8 @@ export class Cache {
         ? `${actualCacheKey}/${await hashUtils.checksumFile(path)}`
         : expectedChecksum!;
 
-      if (stamp !== null && !isVerified && actualChecksum === expectedChecksum) {
+      // Immutable caches can still be trusted from their stamps, but they don't get new ones
+      if (stamp !== null && !isVerified && actualChecksum === expectedChecksum && !this.immutable) {
         const stampPathTemp = `${stampPath}${this.cacheId}` as PortablePath;
         await xfs.mkdirPromise(ppath.dirname(stampPath!), {recursive: true})
           .then(() => xfs.writeFilePromise(stampPathTemp, stamp))

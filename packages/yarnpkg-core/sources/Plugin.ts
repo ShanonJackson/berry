@@ -124,16 +124,16 @@ export interface Hooks {
   /**
    * Called at the start of an install when none of its inputs (lockfile,
    * manifests, configuration, Yarn and Node versions) changed since the last
-   * install that fully succeeded. Starts with `false`; the plugin of the
-   * active linker can set it to `true` if the artifacts it wrote are still
-   * intact, in which case the install has nothing left to do and stops there.
-   * Any plugin can set it back to `false`.
+   * install that fully succeeded. Starts with `null`; the plugin of the
+   * active linker sets it to `true` if the artifacts it wrote are still
+   * intact, and the install only stops there if it's `true` in the end. Any
+   * plugin can set it to `false`, and must then keep it `false`.
    */
   isInstallUpToDate?: (
-    upToDate: boolean,
+    upToDate: boolean | null,
     project: Project,
     options: InstallOptions,
-  ) => Promise<boolean>;
+  ) => Promise<boolean | null>;
 
   /**
    * Called when computing the key that decides whether an install can be

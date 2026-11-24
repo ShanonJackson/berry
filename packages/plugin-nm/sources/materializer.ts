@@ -149,7 +149,13 @@ export class Materializer {
 
     return new Promise<boolean>((resolve, reject) => {
       this.callbacks.set(id, {resolve, reject});
-      slot.worker.postMessage({id, ...request} satisfies MaterializerRequest, transferList);
+      try {
+        slot.worker.postMessage({id, ...request} satisfies MaterializerRequest, transferList);
+      } catch (error) {
+        slot.pending.delete(id);
+        this.callbacks.delete(id);
+        reject(error);
+      }
     });
   }
 }
@@ -251,11 +257,17 @@ function materializerWorker(parentPort: import('worker_threads').MessagePort, fs
     const createdFiles: Array<string> = [];
     const createdDirs: Array<string> = [];
 
+    // Records every directory it creates (a scope folder too), so that undoing removes the empty ones
     const mkdir = (dir: string) => {
       const firstCreated = fs.mkdirSync(dir, {recursive: true});
-      if (typeof firstCreated !== `undefined`) {
-        createdDirs.push(dir);
-      }
+      if (typeof firstCreated === `undefined`)
+        return;
+
+      const created = [dir];
+      for (let parent = path.dirname(dir); parent.length >= firstCreated.length && parent !== created[created.length - 1]; parent = path.dirname(parent))
+        created.push(parent);
+
+      createdDirs.push(...created.reverse());
     };
 
     try {
@@ -284,9 +296,13 @@ function materializerWorker(parentPort: import('worker_threads').MessagePort, fs
       }
     } catch {
       // The store changed under our feet: undo what we did, and let the main thread do it again
-      for (const file of createdFiles.reverse())
-        fs.rmSync(file, {force: true});
+      for (const file of createdFiles.reverse()) {
+        try {
+          fs.rmSync(file, {force: true});
+        } catch {}
+      }
 
+      // Only empty directories are removed: another package of the same scope may be written at the same time
       for (const dir of createdDirs.reverse()) {
         try {
           fs.rmdirSync(dir);

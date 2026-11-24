@@ -400,6 +400,77 @@ describe(`Features`, () => {
       }),
     );
 
+    test(`it should not skip an install when node_modules doesn't come from the install the state describes`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, CONFIG, async ({path, run, source}) => {
+        const manifestPath = ppath.join(path, Filename.manifest);
+        const installStatePath = ppath.join(path, `.yarn/install-state.gz` as PortablePath);
+
+        const lockfilePath = ppath.join(path, Filename.lockfile);
+
+        await run(`install`);
+        const manifest = await xfs.readFilePromise(manifestPath);
+        const lockfile = await xfs.readFilePromise(lockfilePath);
+        const installState = await xfs.readFilePromise(installStatePath);
+
+        // Like an install that wrote node_modules but stopped before writing its state, or a CI restoring both from
+        // different caches
+        await xfs.writeJsonPromise(manifestPath, {dependencies: {[`no-deps`]: `2.0.0`}});
+        await run(`install`);
+
+        await xfs.writeFilePromise(manifestPath, manifest);
+        await xfs.writeFilePromise(lockfilePath, lockfile);
+        await xfs.writeFilePromise(installStatePath, installState);
+
+        const {stdout} = await run(`install`);
+        expect(stdout).not.toMatch(UP_TO_DATE);
+        await expect(source(`require('no-deps')`)).resolves.toMatchObject({version: `1.0.0`});
+      }),
+    );
+
+    test(`it should skip an install when folders were added to node_modules`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, CONFIG, async ({path, run}) => {
+        await run(`install`);
+
+        // Tools often keep their caches there, which an install leaves alone
+        await xfs.mkdirPromise(ppath.join(path, `node_modules/.cache/tool` as PortablePath), {recursive: true});
+        await xfs.mkdirPromise(ppath.join(path, `node_modules/no-deps/node_modules` as PortablePath), {recursive: true});
+
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+      }),
+    );
+
+    test(`it should skip an install when only settings changing the output changed`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, CONFIG, async ({path, run}) => {
+        await run(`install`);
+
+        const {stdout} = await run(`install`, {env: {YARN_ENABLE_PROGRESS_BARS: `true`, YARN_ENABLE_TIMERS: `false`, YARN_NPM_AUTH_TOKEN: `secret`}});
+        expect(stdout).toMatch(UP_TO_DATE);
+      }),
+    );
+
+    test(`it should not skip an install when a module required by a plugin changed`,
+      makeTemporaryEnv({
+        dependencies: {[`no-deps`]: `1.0.0`},
+      }, CONFIG, async ({path, run}) => {
+        const helperPath = ppath.join(path, `helper.cjs` as Filename);
+        await xfs.writeFilePromise(ppath.join(path, `plugin.cjs` as Filename), `module.exports = {name: \`my-plugin\`, factory: () => ({}), version: require(\`./helper.cjs\`)};\n`);
+        await xfs.writeFilePromise(helperPath, `module.exports = 1;\n`);
+        await xfs.writeFilePromise(ppath.join(path, Filename.rc), `plugins:\n  - ./plugin.cjs\n`, {flag: `a`});
+
+        await run(`install`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.stringMatching(UP_TO_DATE)});
+
+        await xfs.writeFilePromise(helperPath, `module.exports = 2;\n`);
+        await expect(run(`install`)).resolves.toMatchObject({stdout: expect.not.stringMatching(UP_TO_DATE)});
+      }),
+    );
+
     test(`it should not skip an install when a plugin changed`,
       makeTemporaryEnv({
         dependencies: {[`no-deps`]: `1.0.0`},

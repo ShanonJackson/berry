@@ -57,6 +57,24 @@ export const LOCKFILE_VERSION = miscUtils.parseInt(
 const INSTALL_STATE_VERSION = 3;
 
 const MULTIPLE_KEYS_REGEXP = / *, */g;
+
+// Settings that don't change what an install does, so that changing them doesn't prevent skipping it
+const UP_TO_DATE_IGNORED_SETTINGS = new Set([
+  `enableColors`,
+  `enableHyperlinks`,
+  `enableInlineBuilds`,
+  `enableMessageNames`,
+  `enableProgressBars`,
+  `enableTelemetry`,
+  `enableTimers`,
+  `enableTips`,
+  `preferInteractive`,
+  `preferTruncatedLines`,
+  `telemetryInterval`,
+  `telemetryUserId`,
+  `npmAuthIdent`,
+  `npmAuthToken`,
+]);
 const TRAILING_SLASH_REGEXP = /\/$/;
 
 const FETCHER_CONCURRENCY = 32;
@@ -1188,7 +1206,9 @@ export class Project {
     await report.reportProgress(progress);
 
     // Workers pulling from a shared iterator, rather than one queued task per package: p-limit dequeues with
-    // Array#shift, which is linear in the queue size and adds up to seconds with tens of thousands of packages
+    // Array#shift, which is linear in the queue size and adds up to seconds with tens of thousands of packages. It must
+    // stay an array iterator: those have no `return()`, so a worker that throws out of its loop (only an assertion
+    // can) doesn't close it for the others
     const pendingLocatorHashes = locatorHashes.values();
     const fetchPackage = async (locatorHash: LocatorHash) => {
       const pkg = this.storedPackages.get(locatorHash);
@@ -2051,9 +2071,11 @@ export class Project {
       if (!xfs.existsSync(archive))
         return false;
 
-    return await this.configuration.reduceHook(hooks => {
+    const upToDate = await this.configuration.reduceHook(hooks => {
       return hooks.isInstallUpToDate;
-    }, false, this, opts);
+    }, null as boolean | null, this, opts);
+
+    return upToDate === true;
   }
 
   private makeUpToDateKey(upToDateHash: string, opts: InstallOptions) {
@@ -2102,26 +2124,41 @@ export class Project {
       }
     };
 
-    // Yarn itself (by content, since checkouts don't preserve mtimes), its plugins, Node, and the system
+    // Yarn itself, its plugins and every module they loaded (by content, since checkouts don't preserve mtimes), Node,
+    // and the system
     try {
       update(YarnVersion ?? ``, process.version, JSON.stringify(nodeUtils.getArchitecture()));
-      if (process.argv[1])
-        update(await xfs.readFilePromise(npath.toPortablePath(process.argv[1])));
-
       update(JSON.stringify([...this.configuration.plugins.keys()]));
-      for (const pluginPath of this.configuration.pluginPaths.values()) {
-        update(await xfs.readFilePromise(pluginPath));
+
+      const modulePaths = new Set(miscUtils.getLoadedModulePaths());
+      for (const pluginPath of this.configuration.pluginPaths.values())
+        modulePaths.add(npath.fromPortablePath(pluginPath));
+
+      for (const modulePath of [...modulePaths].sort()) {
+        update(modulePath, await xfs.readFilePromise(npath.toPortablePath(modulePath)));
       }
     } catch {
       return null;
     }
 
+    // What plugins already contribute to the hash that decides when packages must be built again
+    await this.configuration.triggerHook(hooks => {
+      return hooks.globalHashGeneration;
+    }, this, (data: Buffer | string) => {
+      update(data);
+    });
+
     // Whether the install persists the project (which writes the lockfile and the manifests)
     update(opts.persistProject === false ? `no-persist` : `persist`);
 
-    // Every setting, wherever it comes from (rc files, environment)
-    update(JSON.stringify([...this.configuration.values], (key, value) => {
-      if (value instanceof Map || value instanceof Set)
+    // Every setting, wherever it comes from (rc files, environment), except those that only change how the install
+    // reports what it does, and credentials (which may change on every CI run, without changing what's installed)
+    update(JSON.stringify(this.configuration.values, (key, value) => {
+      if (UP_TO_DATE_IGNORED_SETTINGS.has(key))
+        return undefined;
+      if (value instanceof Map)
+        return [...value].filter(([name]) => !UP_TO_DATE_IGNORED_SETTINGS.has(name));
+      if (value instanceof Set)
         return [...value];
       return value;
     }));

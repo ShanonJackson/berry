@@ -29,7 +29,7 @@ const plugin: Plugin<Hooks> = {
       await xfs.removePromise(getDirCloneStore(configuration));
     },
     isInstallUpToDate: async (upToDate, project) => {
-      if (project.configuration.get(`nodeLinker`) !== `node-modules`)
+      if (upToDate === false || project.configuration.get(`nodeLinker`) !== `node-modules`)
         return upToDate;
 
       return await isNodeModulesUpToDate(project);
