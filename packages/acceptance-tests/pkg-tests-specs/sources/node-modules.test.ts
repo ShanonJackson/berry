@@ -1524,6 +1524,59 @@ describe(`Node_Modules`, () => {
     ),
   );
 
+  test(`should read the bins of packages from the global store, and never from a manifest modified through node_modules, in nmMode: hardlinks-global`,
+    makeTemporaryEnv(
+      {
+        dependencies: {
+          [`has-bin-entries`]: `1.0.0`,
+        },
+      },
+      {
+        nodeLinker: `node-modules`,
+        nmMode: `hardlinks-global`,
+      },
+      async ({path, run}) => {
+        const binPath = ppath.join(path, `node_modules/.bin/has-bin-entries` as PortablePath);
+        const manifestPath = ppath.join(path, `node_modules/has-bin-entries/package.json` as PortablePath);
+        const storeDir = ppath.join(path, `.yarn/global/store/v1` as PortablePath);
+
+        // Like a fresh checkout: without an install state, the manifests have to be read again
+        const reinstall = async () => {
+          await xfs.removePromise(ppath.join(path, Filename.nodeModules));
+          await xfs.removePromise(ppath.join(path, `.yarn/install-state.gz` as PortablePath));
+          await run(`install`);
+        };
+
+        const countPackageDataFiles = async () => {
+          let count = 0;
+          for (const bucket of await xfs.readdirPromise(storeDir))
+            for (const entry of await xfs.readdirPromise(ppath.join(storeDir, bucket)))
+              if (entry.endsWith(`.pkgdata`))
+                count += 1;
+
+          return count;
+        };
+
+        await run(`install`);
+        await expect(countPackageDataFiles()).resolves.toEqual(0);
+
+        // Editing the manifest in node_modules edits the store too, before anything was read from it
+        const manifest = await xfs.readJsonPromise(manifestPath);
+        delete manifest.bin;
+        await xfs.writeFilePromise(manifestPath, JSON.stringify(manifest));
+
+        for (let t = 0; t < 3; ++t) {
+          await reinstall();
+          await expect(xfs.existsPromise(binPath)).resolves.toEqual(true);
+          await expect(xfs.readJsonPromise(manifestPath)).resolves.toHaveProperty([`bin`, `has-bin-entries`]);
+        }
+
+        // Both packages were eventually read from the store
+        await expect(countPackageDataFiles()).resolves.toEqual(2);
+      },
+    ),
+  );
+
   test(`should index conditional packages in the global store in nmMode: hardlinks-global`,
     makeTemporaryEnv(
       {

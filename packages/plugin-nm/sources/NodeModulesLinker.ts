@@ -451,9 +451,42 @@ async function extractCustomPackageData(pkg: Package, fetchResult: FetchResult, 
   return makeCustomPackageData(manifest, jsInstallUtils.hasBindingGyp(fetchResult));
 }
 
+/**
+ * What the linker needs from a package in the store, next to its index. The index lists every file of the package,
+ * so parsing it just for the manifest costs more than everything else the linker does for the package.
+ *
+ * It's only written from a manifest that passed the same check as before linking it, so it holds what the archive
+ * holds, even if the manifest is modified through node_modules later on.
+ */
+type StorePackageData = {
+  version: 1;
+  hasBindingGyp: boolean;
+  bin: Array<[string, string]>;
+  scripts: Array<[string, string]>;
+};
+
 // Synchronous on purpose: packages are installed one after the other, so each round-trip through the libuv threadpool
 // would add up, while these calls only take a few microseconds each
 function extractCustomPackageDataFromStore(globalHardlinksStore: PortablePath, packageChecksum: string) {
+  const packageDataPath = getStorePackageDataPath(globalHardlinksStore, packageChecksum);
+
+  let packageData: StorePackageData | null = null;
+  try {
+    packageData = JSON.parse(xfs.readFileSync(packageDataPath, `utf8`));
+  } catch {}
+
+  if (packageData?.version === 1) {
+    return {
+      manifest: {
+        bin: new Map(packageData.bin as Array<[string, PortablePath]>),
+        scripts: new Map(packageData.scripts),
+      },
+      misc: {
+        hasBindingGyp: packageData.hasBindingGyp,
+      },
+    };
+  }
+
   let index: Record<string, DirEntry>;
   try {
     index = JSON.parse(xfs.readFileSync(getStoreIndexPath(globalHardlinksStore, packageChecksum), `utf8`));
@@ -467,27 +500,62 @@ function extractCustomPackageDataFromStore(globalHardlinksStore: PortablePath, p
     return null;
 
   const manifestEntry = Object.hasOwn(index, Filename.manifest) ? index[Filename.manifest] : null;
-  if (manifestEntry === null)
-    return makeCustomPackageData(new Manifest(), bindingGyp !== null);
 
-  // Same check as before linking a file from the store, since it may have been modified through node_modules
-  if (manifestEntry.kind !== DirEntryKind.FILE || !manifestEntry.digest || !manifestEntry.mtimeMs)
-    return null;
-
-  const contentFilePath = getStoreContentPath(globalHardlinksStore, manifestEntry.digest);
-
-  let content: string;
-  try {
-    const stats = xfs.statSync(contentFilePath);
-    if (stats.mtimeMs > manifestEntry.mtimeMs || stats.mtimeMs < manifestEntry.mtimeMs - MTIME_ACCURANCY)
+  let customPackageData: ReturnType<typeof makeCustomPackageData>;
+  if (manifestEntry === null) {
+    customPackageData = makeCustomPackageData(new Manifest(), bindingGyp !== null);
+  } else {
+    // Same check as before linking a file from the store, since it may have been modified through node_modules
+    if (manifestEntry.kind !== DirEntryKind.FILE || !manifestEntry.digest || !manifestEntry.mtimeMs)
       return null;
 
-    content = xfs.readFileSync(contentFilePath, `utf8`);
-  } catch {
-    return null;
+    const manifestFile = {digest: manifestEntry.digest, mtimeMs: manifestEntry.mtimeMs};
+
+    let content: string;
+    try {
+      if (!isStoreFileIntact(globalHardlinksStore, manifestFile))
+        return null;
+
+      content = xfs.readFileSync(getStoreContentPath(globalHardlinksStore, manifestFile.digest), `utf8`);
+    } catch {
+      return null;
+    }
+
+    customPackageData = makeCustomPackageData(Manifest.fromText(content), bindingGyp !== null);
   }
 
-  return makeCustomPackageData(Manifest.fromText(content), bindingGyp !== null);
+  writeStorePackageData(packageDataPath, {
+    version: 1,
+    hasBindingGyp: customPackageData.misc.hasBindingGyp,
+    bin: [...customPackageData.manifest.bin],
+    scripts: [...customPackageData.manifest.scripts],
+  });
+
+  return customPackageData;
+}
+
+function isStoreFileIntact(globalHardlinksStore: PortablePath, {digest, mtimeMs}: {digest: string, mtimeMs: number}) {
+  let stats;
+  try {
+    stats = xfs.statSync(getStoreContentPath(globalHardlinksStore, digest));
+  } catch {
+    return false;
+  }
+
+  return stats.mtimeMs <= mtimeMs && stats.mtimeMs >= mtimeMs - MTIME_ACCURANCY;
+}
+
+// Written once per package, the next time it's installed from the store; failing to write it only costs performance
+function writeStorePackageData(packageDataPath: PortablePath, packageData: StorePackageData) {
+  const tmpPath = `${packageDataPath}.${process.pid}-${crypto.randomBytes(4).toString(`hex`)}.tmp` as PortablePath;
+  try {
+    xfs.writeFileSync(tmpPath, JSON.stringify(packageData));
+    xfs.renameSync(tmpPath, packageDataPath);
+  } catch {
+    try {
+      xfs.removeSync(tmpPath);
+    } catch {}
+  }
 }
 
 function makeCustomPackageData(manifest: Manifest, hasBindingGyp: boolean) {
@@ -964,6 +1032,10 @@ async function writePackageFromArchive(materializer: Materializer, dstDir: Porta
 
 function getStoreIndexPath(globalHardlinksStore: PortablePath, packageChecksum: string) {
   return ppath.join(globalHardlinksStore, packageChecksum.substring(0, 2) as Filename, `${packageChecksum.substring(2)}.json` as Filename);
+}
+
+function getStorePackageDataPath(globalHardlinksStore: PortablePath, packageChecksum: string) {
+  return ppath.join(globalHardlinksStore, packageChecksum.substring(0, 2) as Filename, `${packageChecksum.substring(2)}.pkgdata` as Filename);
 }
 
 function getStoreContentPath(globalHardlinksStore: PortablePath, digest: string) {
