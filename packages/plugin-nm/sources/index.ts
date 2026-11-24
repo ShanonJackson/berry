@@ -5,6 +5,7 @@ import {NodeModulesHoistingLimits}          from '@yarnpkg/nm';
 import {NodeModulesLinker, NodeModulesMode} from './NodeModulesLinker';
 import {getDirCloneStore}                   from './NodeModulesLinker';
 import {getGlobalHardlinksStore}            from './NodeModulesLinker';
+import {isNodeModulesUpToDate}              from './NodeModulesLinker';
 import {PnpLooseLinker}                     from './PnpLooseLinker';
 
 export {NodeModulesLinker};
@@ -26,6 +27,12 @@ const plugin: Plugin<Hooks> = {
       const globalHardlinksDirectory = getGlobalHardlinksStore(configuration);
       await xfs.removePromise(globalHardlinksDirectory);
       await xfs.removePromise(getDirCloneStore(configuration));
+    },
+    isInstallUpToDate: async (upToDate, project) => {
+      if (upToDate === false || project.configuration.get(`nodeLinker`) !== `node-modules`)
+        return upToDate;
+
+      return await isNodeModulesUpToDate(project);
     },
   },
   configuration: {

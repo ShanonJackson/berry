@@ -30,6 +30,7 @@ import {SUPPORTS_GROUPS, StreamReport}                                  from './
 import {ThrowReport}                                                    from './ThrowReport';
 import {WorkspaceResolver}                                              from './WorkspaceResolver';
 import {Workspace}                                                      from './Workspace';
+import {YarnVersion}                                                    from './YarnVersion';
 import {isFolderInside}                                                 from './folderUtils';
 import * as formatUtils                                                 from './formatUtils';
 import * as hashUtils                                                   from './hashUtils';
@@ -56,6 +57,24 @@ export const LOCKFILE_VERSION = miscUtils.parseInt(
 const INSTALL_STATE_VERSION = 3;
 
 const MULTIPLE_KEYS_REGEXP = / *, */g;
+
+// Settings that don't change what an install does, so that changing them doesn't prevent skipping it
+const UP_TO_DATE_IGNORED_SETTINGS = new Set([
+  `enableColors`,
+  `enableHyperlinks`,
+  `enableInlineBuilds`,
+  `enableMessageNames`,
+  `enableProgressBars`,
+  `enableTelemetry`,
+  `enableTimers`,
+  `enableTips`,
+  `preferInteractive`,
+  `preferTruncatedLines`,
+  `telemetryInterval`,
+  `telemetryUserId`,
+  `npmAuthIdent`,
+  `npmAuthToken`,
+]);
 const TRAILING_SLASH_REGEXP = /\/$/;
 
 const FETCHER_CONCURRENCY = 32;
@@ -148,6 +167,15 @@ export type InstallOptions = {
    * install has completed.
    */
   persistProject?: boolean;
+
+  /**
+   * If true, the install is skipped when nothing it depends on changed since
+   * the last one that fully succeeded, and the linker confirms that what it
+   * wrote is intact. Only commands that install the project as its manifests
+   * and lockfile describe it should set this: those that change resolutions in
+   * memory first (`yarn dedupe`, `yarn up`, ...) must not.
+   */
+  skipIfUpToDate?: boolean;
 };
 
 const INSTALL_STATE_FIELDS = {
@@ -169,6 +197,7 @@ const INSTALL_STATE_FIELDS = {
   restoreBuildState: [
     `skippedBuilds`,
     `storedBuildState`,
+    `storedUpToDateKey`,
   ] as const,
 };
 
@@ -273,6 +302,16 @@ export class Project {
   public originalPackages: Map<LocatorHash, Package> = new Map();
   public optionalBuilds: Set<LocatorHash> = new Set();
   public skippedBuilds: Set<LocatorHash> = new Set();
+
+  /**
+   * Set by the last install if it fully succeeded: a hash of everything the
+   * install depends on, and the cache archives it used. The next install can
+   * skip all of its steps if none of that changed (see `isUpToDate`).
+   */
+  public storedUpToDateKey: {key: string, archives: Array<PortablePath>} | null = null;
+
+  // Whether all the builds that had to run during the last link succeeded
+  private areBuildsComplete: boolean = false;
 
   /**
    * If true, the data contained within `originalPackages` are from a different
@@ -456,26 +495,50 @@ export class Project {
     this.workspacesByCwd = new Map();
     this.workspacesByIdent = new Map();
 
-    const pathsChecked = new Set<PortablePath>();
     const limitSetup = pLimit(4);
 
-    const loadWorkspaceReducer = async (previousTask: Promise<void>, workspaceCwd: PortablePath): Promise<void> => {
-      if (pathsChecked.has(workspaceCwd))
-        return previousTask;
+    // Workspaces are set up level by level, in parallel. A folder that several workspaces list belongs to the first of
+    // them in that order (the closest to the root), never to whichever was set up first, and the workspaces are then
+    // added depth-first, so their order doesn't depend on timing.
+    const root = new Workspace(this.cwd, {project: this});
+    const children = new Map<Workspace, Array<Workspace>>();
+    const claimed = new Set<PortablePath>([this.cwd]);
 
-      pathsChecked.add(workspaceCwd);
+    let level = [root];
+    while (level.length > 0) {
+      const results = await Promise.allSettled(level.map(workspace => limitSetup(() => workspace.setup())));
+      for (const result of results)
+        if (result.status === `rejected`)
+          throw result.reason;
 
-      const workspace = new Workspace(workspaceCwd, {project: this});
-      await limitSetup(() => workspace.setup());
+      const nextLevel: Array<Workspace> = [];
+      for (const workspace of level) {
+        const owned: Array<Workspace> = [];
+        for (const childCwd of workspace.workspacesCwds) {
+          if (claimed.has(childCwd))
+            continue;
 
-      const nextTask = previousTask.then(() => {
-        this.addWorkspace(workspace);
-      });
+          claimed.add(childCwd);
 
-      return Array.from(workspace.workspacesCwds).reduce(loadWorkspaceReducer, nextTask);
+          const child = new Workspace(childCwd, {project: this});
+          owned.push(child);
+          nextLevel.push(child);
+        }
+
+        children.set(workspace, owned);
+      }
+
+      level = nextLevel;
+    }
+
+    const addWorkspaceTree = (workspace: Workspace) => {
+      this.addWorkspace(workspace);
+      for (const child of children.get(workspace)!) {
+        addWorkspaceTree(child);
+      }
     };
 
-    await loadWorkspaceReducer(Promise.resolve(), this.cwd);
+    addWorkspaceTree(root);
   }
 
   private addWorkspace(workspace: Workspace) {
@@ -1142,9 +1205,12 @@ export class Project {
     const progress = Report.progressViaCounter(locatorHashes.length);
     await report.reportProgress(progress);
 
-    const limit = pLimit(FETCHER_CONCURRENCY);
-
-    await miscUtils.allSettledSafe(locatorHashes.map(locatorHash => limit(async () => {
+    // Workers pulling from a shared iterator, rather than one queued task per package: p-limit dequeues with
+    // Array#shift, which is linear in the queue size and adds up to seconds with tens of thousands of packages. It must
+    // stay an array iterator: those have no `return()`, so a worker that throws out of its loop (only an assertion
+    // can) doesn't close it for the others
+    const pendingLocatorHashes = locatorHashes.values();
+    const fetchPackage = async (locatorHash: LocatorHash) => {
       const pkg = this.storedPackages.get(locatorHash);
       if (!pkg)
         throw new Error(`Assertion failed: The locator should have been registered`);
@@ -1170,9 +1236,17 @@ export class Project {
       if (fetchResult.releaseFs) {
         fetchResult.releaseFs();
       }
-    }).finally(() => {
-      progress.tick();
-    })));
+    };
+
+    await miscUtils.allSettledSafe(Array.from({length: FETCHER_CONCURRENCY}, async () => {
+      for (const locatorHash of pendingLocatorHashes) {
+        try {
+          await fetchPackage(locatorHash);
+        } finally {
+          progress.tick();
+        }
+      }
+    }));
 
     if (firstError)
       throw firstError;
@@ -1749,6 +1823,7 @@ export class Project {
     // package (and avoid rebuilding it later if it didn't change).
 
     this.storedBuildState = nextBState;
+    this.areBuildsComplete = Array.from(packageBuildDirectives.keys()).every(locatorHash => nextBState.has(locatorHash));
     this.skippedBuilds = nextSkippedBuilds;
   }
 
@@ -1793,6 +1868,28 @@ export class Project {
 
     if (hasPreErrors)
       return;
+
+    // What this install starts from, compared to what the last one ended with (installs that persist the project
+    // compute it again once they're done, so there's no need for it if there's nothing to compare it to)
+    const upToDateHash = this.storedUpToDateKey !== null || opts.persistProject === false
+      ? await this.getUpToDateHash(opts)
+      : null;
+
+    // The packages the lockfile lists (before the resolution step replaces them with what it resolves)
+    const lockfileLocators = new Set(this.originalPackages.keys());
+
+    if (upToDateHash !== null && await this.isUpToDate(upToDateHash, opts)) {
+      opts.report.reportInfo(MessageName.UNNAMED, `Already up to date`);
+
+      // The validation hooks look at the dependency tree, which the lockfile (unchanged since) resolves to
+      await this.restoreInstallState({restoreLinkersCustomData: false, restoreBuildState: false, restoreResolutions: true});
+
+      await this.completeInstall(opts);
+      return;
+    }
+
+    // Until this install fully succeeds, the next one can't skip anything
+    this.storedUpToDateKey = null;
 
     const packageExtensions = await this.configuration.getPackageExtensions();
 
@@ -1915,10 +2012,26 @@ export class Project {
           opts.report.reportError(MessageName.FROZEN_ARTIFACT_EXCEPTION, `The checksum for ${immutablePatterns[t]} has been modified by this install, which is explicitly forbidden.`);
         }
       }
+
+      // Stored along with the rest of the install state, right below. Installs that persist the project may have
+      // rewritten the lockfile and the manifests, so what the next install will start from has to be computed again;
+      // other installs (`yarn workspaces focus` and similar) only changed what they resolved, which isn't on disk
+      const finalUpToDateHash = opts.persistProject !== false
+        ? await this.getUpToDateHash(opts)
+        : this.isLockfileUpToDate(lockfileLocators) ? upToDateHash : null;
+
+      this.storedUpToDateKey = finalUpToDateHash !== null ? this.makeUpToDateKey(finalUpToDateHash, opts) : null;
     });
 
     await this.persistInstallStateFile();
+    await this.completeInstall(opts);
+  }
 
+  /**
+   * The last steps of an install, which also run when there was nothing else
+   * to do: they validate the project as it is now, not what the install did.
+   */
+  private async completeInstall(opts: InstallOptions) {
     let hasPostErrors = false;
     await opts.report.startTimerPromise(`Post-install validation`, {
       skipIfEmpty: true,
@@ -1942,6 +2055,151 @@ export class Project {
     await this.configuration.triggerHook(hooks => {
       return hooks.afterAllInstalled;
     }, this, opts);
+  }
+
+  /**
+   * An install has nothing to do if the last one fully succeeded, none of its
+   * inputs changed since, the cache archives it used are all still there, and
+   * the linker confirms that what it wrote is intact. Only regular installs
+   * qualify (no special mode, nor any option that asks for extra checks).
+   */
+  private async isUpToDate(upToDateHash: string, opts: InstallOptions) {
+    if (this.storedUpToDateKey === null || this.storedUpToDateKey.key !== upToDateHash)
+      return false;
+
+    for (const archive of this.storedUpToDateKey.archives)
+      if (!xfs.existsSync(archive))
+        return false;
+
+    const upToDate = await this.configuration.reduceHook(hooks => {
+      return hooks.isInstallUpToDate;
+    }, null as boolean | null, this, opts);
+
+    return upToDate === true;
+  }
+
+  private makeUpToDateKey(upToDateHash: string, opts: InstallOptions) {
+    if (!this.areBuildsComplete)
+      return null;
+
+    // An install that reported errors exits with an error, so the next one must try again
+    const report = opts.report as Report & {hasErrors?: () => boolean};
+    if (typeof report.hasErrors !== `function` || report.hasErrors())
+      return null;
+
+    return {key: upToDateHash, archives: [...opts.cache.markedFiles].sort()};
+  }
+
+  // Installs that don't persist the project leave the lockfile as it is, so their key (computed from it) only holds if
+  // they didn't resolve anything it doesn't list (for instance a dependency added since it was last written)
+  private isLockfileUpToDate(lockfileLocators: Set<LocatorHash>) {
+    for (const locatorHash of this.originalPackages.keys())
+      if (!lockfileLocators.has(locatorHash))
+        return false;
+
+    return true;
+  }
+
+  // A hash of everything an install depends on, or null for the installs that can't be skipped
+  private async getUpToDateHash(opts: InstallOptions) {
+    if (!opts.skipIfUpToDate)
+      return null;
+
+    if (typeof opts.mode !== `undefined` || opts.lockfileOnly || opts.checkResolutions || opts.cache.check || opts.fetcher || opts.resolver || this.lockfileNeedsRefresh)
+      return null;
+
+    // Installs that persist the project prune a project-local cache, which skipping them would bypass
+    if (!this.configuration.get(`enableGlobalCache`) && opts.persistProject !== false)
+      return null;
+
+    return await this.computeUpToDateHash(opts);
+  }
+
+  private async computeUpToDateHash(opts: InstallOptions) {
+    const hash = createHash(`sha512`);
+    const update = (...parts: Array<string | Buffer>) => {
+      for (const part of parts) {
+        hash.update(part);
+        hash.update(`\0`);
+      }
+    };
+
+    // Yarn itself, its plugins and every module they loaded (by content, since checkouts don't preserve mtimes), Node,
+    // and the system
+    try {
+      update(YarnVersion ?? ``, process.version, JSON.stringify(nodeUtils.getArchitecture()));
+      update(JSON.stringify([...this.configuration.plugins.keys()]));
+
+      const modulePaths = new Set(miscUtils.getLoadedModulePaths());
+      for (const pluginPath of this.configuration.pluginPaths.values())
+        modulePaths.add(npath.fromPortablePath(pluginPath));
+
+      for (const modulePath of [...modulePaths].sort()) {
+        update(modulePath, await xfs.readFilePromise(npath.toPortablePath(modulePath)));
+      }
+    } catch {
+      return null;
+    }
+
+    // What plugins already contribute to the hash that decides when packages must be built again
+    await this.configuration.triggerHook(hooks => {
+      return hooks.globalHashGeneration;
+    }, this, (data: Buffer | string) => {
+      update(data);
+    });
+
+    // Whether the install persists the project (which writes the lockfile and the manifests)
+    update(opts.persistProject === false ? `no-persist` : `persist`);
+
+    // Every setting, wherever it comes from (rc files, environment), except those that only change how the install
+    // reports what it does, and credentials (which may change on every CI run, without changing what's installed)
+    update(JSON.stringify(this.configuration.values, (key, value) => {
+      if (UP_TO_DATE_IGNORED_SETTINGS.has(key))
+        return undefined;
+      if (value instanceof Map)
+        return [...value].filter(([name]) => !UP_TO_DATE_IGNORED_SETTINGS.has(name));
+      if (value instanceof Set)
+        return [...value];
+      return value;
+    }));
+
+    // The workspaces as the install sees them, which isn't always what's on disk (`yarn workspaces focus` and similar
+    // commands strip the dependencies of the workspaces they don't install)
+    for (const workspace of this.workspaces)
+      update(workspace.relativeCwd, JSON.stringify(workspace.manifest.exportTo({})));
+
+    try {
+      update(await xfs.readFilePromise(ppath.join(this.cwd, Filename.lockfile)));
+    } catch {
+      return null;
+    }
+
+    // Packages from other protocols (patches, links, ...) can change without anything else changing, so the plugins
+    // that handle them tell what they depend on
+    const keyParts = new Set<string>();
+    for (const pkg of this.originalPackages.values()) {
+      if (pkg.reference.startsWith(`npm:`) || pkg.reference.startsWith(`workspace:`))
+        continue;
+
+      let keyPart: string | null;
+      try {
+        keyPart = await this.configuration.firstHook(hooks => {
+          return hooks.getUpToDateKeyPart;
+        }, this, pkg);
+      } catch {
+        keyPart = null;
+      }
+
+      if (keyPart === null)
+        return null;
+
+      keyParts.add(keyPart);
+    }
+
+    for (const keyPart of [...keyParts].sort())
+      update(keyPart);
+
+    return hash.digest(`hex`);
   }
 
   generateLockfile() {
