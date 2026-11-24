@@ -456,26 +456,50 @@ export class Project {
     this.workspacesByCwd = new Map();
     this.workspacesByIdent = new Map();
 
-    const pathsChecked = new Set<PortablePath>();
     const limitSetup = pLimit(4);
 
-    const loadWorkspaceReducer = async (previousTask: Promise<void>, workspaceCwd: PortablePath): Promise<void> => {
-      if (pathsChecked.has(workspaceCwd))
-        return previousTask;
+    // Workspaces are set up level by level, in parallel. A folder that several workspaces list belongs to the first of
+    // them in that order (the closest to the root), never to whichever was set up first, and the workspaces are then
+    // added depth-first, so their order doesn't depend on timing.
+    const root = new Workspace(this.cwd, {project: this});
+    const children = new Map<Workspace, Array<Workspace>>();
+    const claimed = new Set<PortablePath>([this.cwd]);
 
-      pathsChecked.add(workspaceCwd);
+    let level = [root];
+    while (level.length > 0) {
+      const results = await Promise.allSettled(level.map(workspace => limitSetup(() => workspace.setup())));
+      for (const result of results)
+        if (result.status === `rejected`)
+          throw result.reason;
 
-      const workspace = new Workspace(workspaceCwd, {project: this});
-      await limitSetup(() => workspace.setup());
+      const nextLevel: Array<Workspace> = [];
+      for (const workspace of level) {
+        const owned: Array<Workspace> = [];
+        for (const childCwd of workspace.workspacesCwds) {
+          if (claimed.has(childCwd))
+            continue;
 
-      const nextTask = previousTask.then(() => {
-        this.addWorkspace(workspace);
-      });
+          claimed.add(childCwd);
 
-      return Array.from(workspace.workspacesCwds).reduce(loadWorkspaceReducer, nextTask);
+          const child = new Workspace(childCwd, {project: this});
+          owned.push(child);
+          nextLevel.push(child);
+        }
+
+        children.set(workspace, owned);
+      }
+
+      level = nextLevel;
+    }
+
+    const addWorkspaceTree = (workspace: Workspace) => {
+      this.addWorkspace(workspace);
+      for (const child of children.get(workspace)!) {
+        addWorkspaceTree(child);
+      }
     };
 
-    await loadWorkspaceReducer(Promise.resolve(), this.cwd);
+    addWorkspaceTree(root);
   }
 
   private addWorkspace(workspace: Workspace) {
