@@ -1,12 +1,12 @@
-import {Cache, Configuration, LocatorHash, Package, Project, ThrowReport, structUtils} from '@yarnpkg/core';
-import {Filename, PortablePath, ppath, xfs}                                            from '@yarnpkg/fslib';
-import LinkPlugin                                                                      from '@yarnpkg/plugin-link';
-import PnpPlugin                                                                       from '@yarnpkg/plugin-pnp';
-import v8                                                                              from 'v8';
+import {Cache, Configuration, LocatorHash, Package, Project, ThrowReport, Workspace, structUtils} from '@yarnpkg/core';
+import {Filename, PortablePath, ppath, xfs}                                                       from '@yarnpkg/fslib';
+import LinkPlugin                                                                                 from '@yarnpkg/plugin-link';
+import PnpPlugin                                                                                  from '@yarnpkg/plugin-pnp';
+import v8                                                                                         from 'v8';
 
-import {CorePlugin}                                                                    from '../sources/CorePlugin';
+import {CorePlugin}                                                                               from '../sources/CorePlugin';
 
-import {TestPlugin}                                                                    from './TestPlugin';
+import {TestPlugin}                                                                               from './TestPlugin';
 
 const getConfiguration = (p: PortablePath) => {
   return Configuration.create(p, p, new Map([
@@ -251,6 +251,36 @@ describe(`Project`, () => {
         descriptors: project2.storedDescriptors,
         resolutions: project2.storedResolutions,
       }));
+    });
+  });
+
+  it(`should give a folder listed by several workspaces to the first of them, whichever is set up first`, async () => {
+    await xfs.mktempPromise(async dir => {
+      await xfs.writeJsonPromise(ppath.join(dir, Filename.manifest), {name: `root`, workspaces: [`a`, `b`]});
+      await xfs.writeFilePromise(ppath.join(dir, Filename.lockfile), ``);
+      for (const name of [`a`, `b`]) {
+        await xfs.mkdirpPromise(ppath.join(dir, name as Filename));
+        await xfs.writeJsonPromise(ppath.join(dir, name as Filename, Filename.manifest), {name, workspaces: [`../shared`]});
+      }
+      await xfs.mkdirpPromise(ppath.join(dir, `shared`));
+      await xfs.writeJsonPromise(ppath.join(dir, `shared`, Filename.manifest), {name: `shared`});
+
+      // `a` comes first but finishes its setup last
+      const setup = Workspace.prototype.setup;
+      const spy = jest.spyOn(Workspace.prototype, `setup`).mockImplementation(async function (this: Workspace) {
+        if (ppath.basename(this.cwd) === `a`)
+          await new Promise(resolve => setTimeout(resolve, 50));
+        return setup.call(this);
+      });
+
+      try {
+        const configuration = getConfiguration(dir);
+        const {project} = await Project.find(configuration, dir);
+
+        expect(project.workspaces.map(workspace => workspace.manifest.raw.name)).toEqual([`root`, `a`, `shared`, `b`]);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 

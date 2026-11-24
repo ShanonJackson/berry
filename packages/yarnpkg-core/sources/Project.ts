@@ -477,26 +477,47 @@ export class Project {
     this.workspacesByCwd = new Map();
     this.workspacesByIdent = new Map();
 
-    const pathsChecked = new Set<PortablePath>();
     const limitSetup = pLimit(4);
 
-    const loadWorkspaceReducer = async (previousTask: Promise<void>, workspaceCwd: PortablePath): Promise<void> => {
-      if (pathsChecked.has(workspaceCwd))
-        return previousTask;
+    // Workspaces are set up in parallel (each one starts its children as soon as it's ready), but they're added in
+    // depth-first order. A folder that several workspaces list belongs to the first of them in that order rather than
+    // to whichever was set up first, so the workspace order doesn't depend on timing.
+    const setups = new Map<PortablePath, Promise<Workspace>>();
+    const setupWorkspace = (workspaceCwd: PortablePath): Promise<Workspace> => {
+      let setup = setups.get(workspaceCwd);
+      if (typeof setup === `undefined`) {
+        const workspace = new Workspace(workspaceCwd, {project: this});
+        setup = limitSetup(() => workspace.setup()).then(() => workspace);
+        setups.set(workspaceCwd, setup);
 
-      pathsChecked.add(workspaceCwd);
+        setup.then(workspace => {
+          for (const childCwd of workspace.workspacesCwds) {
+            setupWorkspace(childCwd);
+          }
+        }, () => {
+          // Reported by the depth-first walk below, if it reaches this workspace
+        });
+      }
 
-      const workspace = new Workspace(workspaceCwd, {project: this});
-      await limitSetup(() => workspace.setup());
-
-      const nextTask = previousTask.then(() => {
-        this.addWorkspace(workspace);
-      });
-
-      return Array.from(workspace.workspacesCwds).reduce(loadWorkspaceReducer, nextTask);
+      return setup;
     };
 
-    await loadWorkspaceReducer(Promise.resolve(), this.cwd);
+    const visited = new Set<PortablePath>();
+    const addWorkspaceTree = async (workspaceCwd: PortablePath): Promise<void> => {
+      if (visited.has(workspaceCwd))
+        return;
+
+      visited.add(workspaceCwd);
+
+      const workspace = await setupWorkspace(workspaceCwd);
+      this.addWorkspace(workspace);
+
+      for (const childCwd of workspace.workspacesCwds) {
+        await addWorkspaceTree(childCwd);
+      }
+    };
+
+    await addWorkspaceTree(this.cwd);
   }
 
   private addWorkspace(workspace: Workspace) {
