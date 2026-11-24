@@ -348,11 +348,14 @@ class NodeModulesInstaller implements Installer {
         : null,
     });
 
+    const missingBinTargets: Array<PortablePath> = [];
+
     await persistNodeModules(preinstallState, locatorMap, packageMap, {
       baseFs: defaultFsLayer,
       project: this.opts.project,
       report: this.opts.report,
       realLocatorChecksums: this.realLocatorChecksums,
+      missingBinTargets,
       loadManifest: async locatorKey => {
         const locator = structUtils.parseLocator(locatorKey);
 
@@ -363,6 +366,9 @@ class NodeModulesInstaller implements Installer {
         return slot.customPackageData.manifest;
       },
     });
+
+    this.customData.missingBinTargets = missingBinTargets;
+    this.customData.stateFileHash = await getStateFileHash(this.opts.project);
 
     const installStatuses: Array<FinalizeInstallStatus> = [];
 
@@ -406,6 +412,10 @@ type CustomPackageData = UnboxPromise<ReturnType<typeof extractCustomPackageData
 
 type NodeModulesCustomData = {
   store: Map<LocatorHash, CustomPackageData>;
+  // The binary targets that didn't exist during the last install, whose links an install would add if they appeared
+  missingBinTargets?: Array<PortablePath>;
+  // The state file the last install wrote, which tells that node_modules comes from it (they're stored separately)
+  stateFileHash?: string | null;
 };
 
 // The content checksum of the package archive (used to address the global hardlinks store), without the cache key
@@ -1135,11 +1145,13 @@ const copyPromise = async (dstDir: PortablePath, srcDir: PortablePath, {baseFs, 
  *
  * @returns location tree and bin symlinks with modules, unavailable on disk, removed
  */
-function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: BinSymlinkMap, stateMtimeMs: number, project: Project): {locationTree: LocationTree, binSymlinks: BinSymlinkMap, locatorLocations: Map<LocatorKey, Set<PortablePath>>, installChangedByUser: boolean} {
+function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: BinSymlinkMap, stateMtimeMs: number, project: Project): {locationTree: LocationTree, binSymlinks: BinSymlinkMap, locatorLocations: Map<LocatorKey, Set<PortablePath>>, installChangedByUser: boolean, somethingMissing: boolean} {
   const refinedLocationTree: LocationTree = new Map();
   const refinedBinSymlinks = new Map();
   const locatorLocations = new Map();
   let installChangedByUser = false;
+  // Whether something the last install wrote is gone (as opposed to only added to, which installs leave alone)
+  let somethingMissing = false;
 
   const syncNodeWithDisk = (parentPath: PortablePath, entry: Filename, parentNode: LocationNode, refinedNode: LocationNode, parentDiskEntries: Set<Filename>) => {
     let doesExistOnDisk = true;
@@ -1173,6 +1185,7 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
 
         if (!binStats) {
           installChangedByUser = true;
+          somethingMissing = true;
         } else if (binStats.mtimeMs > stateMtimeMs) {
           installChangedByUser = true;
 
@@ -1183,6 +1196,8 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
           for (const [entry, target] of binarySymlinks) {
             if (diskEntries.has(entry)) {
               refinedBinarySymlinks.set(entry, target);
+            } else {
+              somethingMissing = true;
             }
           }
         } else {
@@ -1207,8 +1222,11 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
       for (const childEntry of node.children.keys()) {
         syncNodeWithDisk(entryPath, childEntry, node, childRefinedNode, childDiskEntries);
       }
-    } else if (node.locator) {
-      project.storedBuildState.delete(structUtils.parseLocator(node.locator).locatorHash);
+    } else {
+      somethingMissing = true;
+      if (node.locator) {
+        project.storedBuildState.delete(structUtils.parseLocator(node.locator).locatorHash);
+      }
     }
   };
 
@@ -1227,7 +1245,7 @@ function syncPreinstallStateWithDisk(locationTree: LocationTree, binSymlinks: Bi
     }
   }
 
-  return {locationTree: refinedLocationTree, binSymlinks: refinedBinSymlinks, locatorLocations, installChangedByUser};
+  return {locationTree: refinedLocationTree, binSymlinks: refinedBinSymlinks, locatorLocations, installChangedByUser, somethingMissing};
 }
 
 function isLinkLocator(locatorKey: LocatorKey): boolean {
@@ -1238,7 +1256,7 @@ function isLinkLocator(locatorKey: LocatorKey): boolean {
   return descriptor.range.startsWith(`link:`);
 }
 
-async function createBinSymlinkMap(installState: NodeModulesLocatorMap, locationTree: LocationTree, projectRoot: PortablePath, {loadManifest}: {loadManifest: LoadManifest}) {
+async function createBinSymlinkMap(installState: NodeModulesLocatorMap, locationTree: LocationTree, projectRoot: PortablePath, {loadManifest, missingBinTargets}: {loadManifest: LoadManifest, missingBinTargets: Array<PortablePath>}) {
   const locatorScriptMap = new Map<LocatorKey, Map<string, string>>();
   for (const [locatorKey, {locations}] of installState) {
     const manifest = !isLinkLocator(locatorKey)
@@ -1248,9 +1266,14 @@ async function createBinSymlinkMap(installState: NodeModulesLocatorMap, location
     const bin = new Map();
     if (manifest) {
       for (const [name, value] of manifest.bin) {
+        if (value === ``)
+          continue;
+
         const target = ppath.join(locations[0], value);
-        if (value !== `` && xfs.existsSync(target)) {
+        if (xfs.existsSync(target)) {
           bin.set(name, value);
+        } else {
+          missingBinTargets.push(target);
         }
       }
     }
@@ -1311,6 +1334,56 @@ const areRealLocatorsEqual = (locatorKey1?: LocatorKey, locatorKey2?: LocatorKey
   return structUtils.areLocatorsEqual(locator1, locator2);
 };
 
+/**
+ * Tells whether the node_modules folders still match what the last install
+ * wrote, without changing them. The core only asks once it knows that none of
+ * the install inputs changed since that install.
+ */
+export async function isNodeModulesUpToDate(project: Project): Promise<boolean> {
+  const nmModeSetting = project.configuration.get(`nmMode`);
+
+  const preinstallState = await findInstallState(project);
+  if (preinstallState === null || preinstallState.nmMode !== nmModeSetting)
+    return false;
+
+  // node_modules and the install state are written separately (an install may stop in between, and CI may restore
+  // them from different caches), so they must both come from the last install
+  const customData = project.linkersCustomData.get(new NodeModulesLinker().getCustomDataKey()) as NodeModulesCustomData | undefined;
+  if (!Array.isArray(customData?.missingBinTargets) || typeof customData.stateFileHash !== `string`)
+    return false;
+
+  if (await getStateFileHash(project) !== customData.stateFileHash)
+    return false;
+
+  // Same check as the one an install does to find out what the user changed on disk. The install only puts back what
+  // went missing (folders and files added since, such as caches, are left alone), so that's all that matters here
+  const {somethingMissing} = syncPreinstallStateWithDisk(preinstallState.locationTree, preinstallState.binSymlinks, preinstallState.mtimeMs, project);
+  if (somethingMissing)
+    return false;
+
+  // Binaries are only linked when their targets exist, so an install would remove the links of the targets that
+  // disappeared, and add those of the ones that appeared since (e.g. workspace binaries built after the last install)
+  for (const symlinks of preinstallState.binSymlinks.values())
+    for (const target of symlinks.values())
+      if (!xfs.existsSync(ppath.resolve(target)))
+        return false;
+
+  for (const target of customData.missingBinTargets)
+    if (xfs.existsSync(target))
+      return false;
+
+  return true;
+}
+
+async function getStateFileHash(project: Project) {
+  try {
+    const content = await xfs.readFilePromise(ppath.join(project.cwd, NODE_MODULES, INSTALL_STATE_FILE));
+    return crypto.createHash(`sha1`).update(content).digest(`hex`);
+  } catch {
+    return null;
+  }
+}
+
 export function getGlobalHardlinksStore(configuration: Configuration): PortablePath {
   return ppath.join(configuration.get(`globalFolder`), `store` as Filename);
 }
@@ -1351,6 +1424,7 @@ type PersistNodeModulesOptions = {
   report: Report;
   loadManifest: LoadManifest;
   realLocatorChecksums: Map<LocatorHash, string | null>;
+  missingBinTargets: Array<PortablePath>;
 };
 
 async function persistNodeModules(preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, opts: PersistNodeModulesOptions) {
@@ -1363,7 +1437,7 @@ async function persistNodeModules(preinstallState: InstallState, installState: N
   }
 }
 
-async function persistNodeModulesWith(materializer: Materializer | null, preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, {baseFs, project, report, loadManifest, realLocatorChecksums}: PersistNodeModulesOptions) {
+async function persistNodeModulesWith(materializer: Materializer | null, preinstallState: InstallState, installState: NodeModulesLocatorMap, packageMap: ReturnType<typeof buildPackageMap>, {baseFs, project, report, loadManifest, realLocatorChecksums, missingBinTargets}: PersistNodeModulesOptions) {
   const rootNmDirPath = ppath.join(project.cwd, NODE_MODULES);
 
   const {
@@ -1711,7 +1785,7 @@ async function persistNodeModulesWith(materializer: Materializer | null, preinst
     });
 
     invalidateBinSymlinks(prevBinSymlinks, new Set(addList.map(l => l.dstDir)));
-    const binSymlinks = await createBinSymlinkMap(installState, locationTree, project.cwd, {loadManifest});
+    const binSymlinks = await createBinSymlinkMap(installState, locationTree, project.cwd, {loadManifest, missingBinTargets});
     await persistBinSymlinks(prevBinSymlinks, binSymlinks, project.cwd, windowsLinkType, dirCloneSlots.size > 0 && nmMode.value === NodeModulesMode.HARDLINKS_LOCAL ? getPackageCopies(installState) : null);
 
     await writeInstallState(project, installState, binSymlinks, nmMode, {installChangedByUser});
