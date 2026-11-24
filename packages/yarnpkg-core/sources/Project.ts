@@ -1142,9 +1142,12 @@ export class Project {
     const progress = Report.progressViaCounter(locatorHashes.length);
     await report.reportProgress(progress);
 
-    const limit = pLimit(FETCHER_CONCURRENCY);
-
-    await miscUtils.allSettledSafe(locatorHashes.map(locatorHash => limit(async () => {
+    // Workers pulling from a shared iterator, rather than one queued task per package: p-limit dequeues with
+    // Array#shift, which is linear in the queue size and adds up to seconds with tens of thousands of packages. It must
+    // stay an array iterator: those have no `return()`, so a worker that throws out of its loop (only an assertion
+    // can) doesn't close it for the others
+    const pendingLocatorHashes = locatorHashes.values();
+    const fetchPackage = async (locatorHash: LocatorHash) => {
       const pkg = this.storedPackages.get(locatorHash);
       if (!pkg)
         throw new Error(`Assertion failed: The locator should have been registered`);
@@ -1170,9 +1173,17 @@ export class Project {
       if (fetchResult.releaseFs) {
         fetchResult.releaseFs();
       }
-    }).finally(() => {
-      progress.tick();
-    })));
+    };
+
+    await miscUtils.allSettledSafe(Array.from({length: FETCHER_CONCURRENCY}, async () => {
+      for (const locatorHash of pendingLocatorHashes) {
+        try {
+          await fetchPackage(locatorHash);
+        } finally {
+          progress.tick();
+        }
+      }
+    }));
 
     if (firstError)
       throw firstError;
